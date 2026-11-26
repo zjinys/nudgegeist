@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nudgegeist
+Name[zh_CN]=辣椒
+Comment=AI Coding Agent Watchdog & Rule Engine GUI
+Exec=nudgegeist
+Icon=nudgegeist
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
+StartupWMClass=nudgegeist

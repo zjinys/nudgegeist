@@ -1,0 +1,18 @@
+pkgname=nudgegeist
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='AI Coding Agent Watchdog and Rule Engine GUI'
+url='https://github.com/zjinys/nudgegeist'
+arch=('x86_64')
+license=('Apache-2.0')
+depends=('libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'fontconfig' 'vulkan-icd-loader')
+# Avoid makepkg debug package generation in container builds where debuginfo is stripped/empty
+options=('!debug')
+
+package() {
+  local target_dir="${CARGO_TARGET_DIR:-$startdir/../../target}"
+  install -Dm755 "$target_dir/release/nudgegeist" "$pkgdir/usr/bin/nudgegeist"
+  install -Dm644 "$startdir/nudgegeist.desktop" "$pkgdir/usr/share/applications/nudgegeist.desktop"
+  install -Dm644 "$startdir/../../assets/nudgegeist-256.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/nudgegeist.png"
+  install -Dm644 "$startdir/../../assets/nudgegeist.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/nudgegeist.png"
+}

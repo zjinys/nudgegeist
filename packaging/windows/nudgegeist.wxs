@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nudgegeist MSI definition (WiX Toolset v3.11+ schema).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Nudgegeist"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Nudgegeist"
+           UpgradeCode="8A643F84-5F9D-4A8D-9C25-4B4A23F3C1E7">
+
+    <Package InstallerVersion="200"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="AI Coding Agent Watchdog and Rule Engine GUI" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Nudgegeist is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <UIRef Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Nudgegeist" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="B5F44149-1D19-4674-96DF-6F8BE0983A33">
+        <File Id="NudgegeistExe"
+              Source="$(var.SourceDir)\nudgegeist.exe"
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="AppShortcut" Guid="C2B571A3-C035-48E0-828C-9A0A90655B21">
+        <Shortcut Id="NudgegeistStartMenuShortcut"
+                  Name="Nudgegeist"
+                  Description="AI Coding Agent Watchdog and Rule Engine GUI"
+                  Target="[INSTALLFOLDER]nudgegeist.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" />
+        <RemoveFolder Id="CleanupProgramMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Nudgegeist"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="Nudgegeist" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="AppShortcut" />
+    </Feature>
+  </Product>
+</Wix>

@@ -1,0 +1,188 @@
+# Multi-platform package build and GitHub Release workflow.
+#
+# Triggers:
+#   - push tags "v*": build all targets and publish artifacts to GitHub Release
+#   - workflow_dispatch: build all targets and upload workflow artifacts only (no Release)
+#
+# Artifacts:
+#   - linux        : nudgegeist_<ver>_amd64.deb, nudgegeist-<ver>-1.*.x86_64.rpm, Nudgegeist-<ver>-x86_64.AppImage
+#   - linux-pacman : nudgegeist-<ver>-1-x86_64.pkg.tar.zst (packaged in archlinux:base-devel reusing Linux release binary)
+#   - macos        : Nudgegeist-<ver>-arm64.dmg (ad-hoc signed .app bundle)
+#   - windows      : Nudgegeist-<ver>-x64.msi, Nudgegeist-<ver>-x64.zip
+
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          tag_ver="${GITHUB_REF_NAME#v}"
+          cargo_ver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          [ "$tag_ver" = "$cargo_ver" ] || {
+            echo "Tag v${tag_ver} does not match Cargo.toml version=${cargo_ver}" >&2
+            exit 1
+          }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config cmake libclang-dev rpm \
+            libxcb1-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package deb
+        env:
+          NUDGEGEIST_SKIP_BUILD: "1"
+        run: ./scripts/package-deb.sh dist
+      - name: Package rpm
+        env:
+          NUDGEGEIST_SKIP_BUILD: "1"
+        run: ./scripts/package-rpm.sh dist
+      - name: Package AppImage
+        env:
+          NUDGEGEIST_SKIP_BUILD: "1"
+        run: ./scripts/package-appimage.sh dist
+      - name: Stage Linux binary for Arch pacman job
+        run: |
+          mkdir -p out/linux-binary
+          cp target/release/nudgegeist out/linux-binary/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: out/linux-binary/nudgegeist
+          if-no-files-found: error
+
+  linux-pacman:
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+          path: target/release
+      - name: Install runtime dependencies in container
+        run: pacman -Sy --noconfirm libxcb libxkbcommon libxkbcommon-x11 fontconfig vulkan-icd-loader
+      - name: Sync PKGBUILD pkgver
+        run: |
+          set -e
+          pkgver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          sed -i "s/^pkgver=.*/pkgver=${pkgver}/" packaging/linux/PKGBUILD
+          chmod +x target/release/nudgegeist
+          useradd -m build
+          chown -R build:build "$GITHUB_WORKSPACE" /tmp
+      - name: Package pacman archive
+        run: |
+          set -e
+          mkdir -p dist
+          chown build:build dist
+          su build -c "cd packaging/linux && PKGDEST=$GITHUB_WORKSPACE/dist makepkg -Cf"
+          ls -lh dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pacman
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package DMG
+        run: ./scripts/package-dmg.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WiX Toolset and package MSI
+        shell: pwsh
+        run: |
+          choco install -y wixtoolset
+          $wixRoots = @(${env:WIX}, "${env:ProgramFiles(x86)}\WiX Toolset v*", "${env:ProgramFiles}\WiX Toolset v*") | Where-Object { $_ }
+          $candle = Get-ChildItem -Path ($wixRoots | ForEach-Object { Join-Path $_ "bin\candle.exe" }) `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $candle) { throw "candle.exe not found after WiX install" }
+          $env:PATH = "$($candle.DirectoryName);$env:PATH"
+          scripts\package-msi.ps1 dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            dist/*.msi
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      && needs.linux.result == 'success'
+      && needs.linux-pacman.result == 'success'
+      && needs.macos.result == 'success'
+      && needs.windows.result == 'success'
+    needs: [linux, linux-pacman, macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.AppImage
+            artifacts/*.pkg.tar.zst
+            artifacts/*.dmg
+            artifacts/*.msi
+            artifacts/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,27 @@
+Name: nudgegeist
+Version: @VERSION@
+Release: 1%{?dist}
+Summary: AI Coding Agent Watchdog and Rule Engine GUI
+License: Apache-2.0
+BuildArch: x86_64
+Requires: libxcb, libxkbcommon, libxkbcommon-x11, fontconfig, vulkan-loader
+
+%description
+Nudgegeist monitors and unblocks stalled AI coding agents through luvus with
+a configurable conservative rule engine, audit trail, and native GPUI desktop GUI.
+
+%install
+mkdir -p %{buildroot}/usr/bin \
+         %{buildroot}/usr/share/applications \
+         %{buildroot}/usr/share/icons/hicolor/256x256/apps \
+         %{buildroot}/usr/share/icons/hicolor/512x512/apps
+install -m 0755 @BIN@ %{buildroot}/usr/bin/nudgegeist
+install -m 0644 @ROOT@/packaging/linux/nudgegeist.desktop %{buildroot}/usr/share/applications/nudgegeist.desktop
+install -m 0644 @ROOT@/assets/nudgegeist-256.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/nudgegeist.png
+install -m 0644 @ROOT@/assets/nudgegeist.png %{buildroot}/usr/share/icons/hicolor/512x512/apps/nudgegeist.png
+
+%files
+/usr/bin/nudgegeist
+/usr/share/applications/nudgegeist.desktop
+/usr/share/icons/hicolor/256x256/apps/nudgegeist.png
+/usr/share/icons/hicolor/512x512/apps/nudgegeist.png

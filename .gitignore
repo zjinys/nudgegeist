@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Packaging outputs
+/dist/
+/out/
+packaging/linux/pkg/
+packaging/linux/src/
+*.pkg.tar.*
+*.pkg.tar.zst
+*.deb
+*.rpm
+*.AppImage
+*.dmg
+*.msi
+
+# Local runtime state / temp data
+.data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Environment & IDE / OS
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
