@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -19,13 +21,34 @@ fn print_help() {
     );
 }
 
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if args
+        .iter()
+        .any(|a| !matches!(a.as_str(), "--dry-run"))
+    {
+        attach_parent_console();
+    }
+
     let mut once = false;
     let mut dry_run = false;
     let mut headless = false;
     let mut install_desktop = false;
 
-    for arg in std::env::args().skip(1) {
+    for arg in &args {
         match arg.as_str() {
             "--once" => once = true,
             "--dry-run" => dry_run = true,

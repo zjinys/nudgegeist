@@ -231,6 +231,19 @@ impl LuvusClient for UnixSocketUhpClient {
     }
 }
 
+/// Build a `luvus` CLI command without flashing a console window on Windows.
+fn new_luvus_command(bin_path: &str) -> Command {
+    let mut cmd = Command::new(bin_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = &mut cmd;
+    cmd
+}
+
 /// CLI subprocess client invoking the `luvus` binary directly.
 #[derive(Debug, Clone)]
 pub struct RealLuvusClient {
@@ -245,7 +258,7 @@ impl RealLuvusClient {
     }
 
     pub fn spawn_events_process(&self) -> Result<Child> {
-        Command::new(&self.bin_path)
+        new_luvus_command(&self.bin_path)
             .arg("events")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -256,7 +269,7 @@ impl RealLuvusClient {
 
 impl LuvusClient for RealLuvusClient {
     fn list_agents(&self) -> Result<Vec<AgentInfo>> {
-        let output = Command::new(&self.bin_path)
+        let output = new_luvus_command(&self.bin_path)
             .args(["agent", "list"])
             .output()
             .with_context(|| format!("执行 `{} agent list` 失败", self.bin_path))?;
@@ -274,7 +287,7 @@ impl LuvusClient for RealLuvusClient {
             MatchSource::Recent => "recent",
         };
         let lines_str = lines.max(1).to_string();
-        let output = Command::new(&self.bin_path)
+        let output = new_luvus_command(&self.bin_path)
             .args([
                 "agent",
                 "read",
@@ -295,7 +308,7 @@ impl LuvusClient for RealLuvusClient {
     }
 
     fn send_keys(&self, pane: &str, keys: &[String]) -> Result<()> {
-        let mut cmd = Command::new(&self.bin_path);
+        let mut cmd = new_luvus_command(&self.bin_path);
         cmd.args(["agent", "keys", pane]);
         for k in keys {
             cmd.arg(k);
@@ -311,7 +324,7 @@ impl LuvusClient for RealLuvusClient {
     }
 
     fn send_text(&self, pane: &str, text: &str) -> Result<()> {
-        let output = Command::new(&self.bin_path)
+        let output = new_luvus_command(&self.bin_path)
             .args(["agent", "send", pane, text])
             .output()
             .with_context(|| format!("执行 `{} agent send {pane}` 失败", self.bin_path))?;
