@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use regex::{Regex, RegexBuilder};
@@ -542,8 +543,8 @@ pub fn default_builtin_rules() -> Vec<Rule> {
                 lines: 12,
                 region: MatchRegion::Full,
                 any_regex: vec![
-                    r"(?m)^[\s›>*-]*\d+\.\s+(Yes|Allow|Proceed|Run|Continue|Retry|Trust|Approve)\b".to_string(),
-                    r"(?m)^[\s›>*-]*(Yes|Allow once|Allow always|Trust and continue|Proceed)\b".to_string(),
+                    r"(?m)^[\s│›>*-]*\d+\.\s+(Yes|Allow|Proceed|Run|Continue|Retry|Trust|Approve)\b".to_string(),
+                    r"(?m)^[\s│›>*-]*(Yes|Allow once|Allow always|Trust and continue|Proceed)\b".to_string(),
                 ],
                 all_regex: vec![],
                 none_regex: vec![],
@@ -561,8 +562,8 @@ pub fn default_builtin_rules() -> Vec<Rule> {
                 text: None,
             },
             dedupe: RuleDedupe {
-                strategy: DedupeStrategy::PaneRule,
-                window_sec: 10,
+                strategy: DedupeStrategy::None,
+                window_sec: 0,
             },
             cooldown_sec: 2,
             max_continuous: 0,
@@ -663,6 +664,29 @@ pub fn compile_regex(pattern: &str, case_insensitive: bool) -> std::result::Resu
         .case_insensitive(case_insensitive)
         .multi_line(true)
         .build()
+}
+
+/// Compile or retrieve a cached multi-line regex so rule evaluations reuse DFAs across scans.
+pub fn compile_regex_cached(
+    pattern: &str,
+    case_insensitive: bool,
+) -> std::result::Result<Arc<Regex>, regex::Error> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, bool), Arc<Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(re) = guard.get(&(pattern.to_string(), case_insensitive))
+    {
+        return Ok(Arc::clone(re));
+    }
+
+    let compiled = Arc::new(compile_regex(pattern, case_insensitive)?);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 512 {
+            guard.clear();
+        }
+        guard.insert((pattern.to_string(), case_insensitive), Arc::clone(&compiled));
+    }
+    Ok(compiled)
 }
 
 pub fn validate_config(cfg: &WatchdogConfig) -> std::result::Result<(), Vec<String>> {

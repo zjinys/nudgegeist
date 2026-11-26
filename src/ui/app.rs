@@ -148,6 +148,8 @@ pub struct WatchdogApp {
     settings: SettingsState,
     status_banner: Option<(bool, String)>,
     last_seen_action_seq: u64,
+    last_state_version: u64,
+    last_clock_tick: Instant,
     window_nudge_seq: u64,
     window_nudge_until: Option<Instant>,
     prev_pane_action_seqs: HashMap<String, u64>,
@@ -223,8 +225,23 @@ impl WatchdogApp {
             loop {
                 smol::Timer::after(Duration::from_millis(800)).await;
                 let res = this.update(cx, |app, cx| {
-                    app.refresh_snapshot();
-                    cx.notify();
+                    let current_ver = app.engine.lock().unwrap().state_version;
+                    if current_ver != app.last_state_version {
+                        app.refresh_snapshot();
+                        app.last_clock_tick = Instant::now();
+                        cx.notify();
+                        return;
+                    }
+                    let mut dirty = app.prune_expired_animations();
+                    if let Some(interval) = app.relative_clock_tick_interval()
+                        && app.last_clock_tick.elapsed() >= interval
+                    {
+                        app.last_clock_tick = Instant::now();
+                        dirty = true;
+                    }
+                    if dirty {
+                        cx.notify();
+                    }
                 });
                 if res.is_err() {
                     break;
@@ -234,6 +251,7 @@ impl WatchdogApp {
         .detach();
 
         let initial_seq = snapshot.action_seq;
+        let initial_ver = snapshot.state_version;
         let initial_pane_seqs: HashMap<String, u64> = snapshot
             .panes
             .iter()
@@ -260,6 +278,8 @@ impl WatchdogApp {
             settings,
             status_banner: None,
             last_seen_action_seq: initial_seq,
+            last_state_version: initial_ver,
+            last_clock_tick: Instant::now(),
             window_nudge_seq: 0,
             window_nudge_until: None,
             prev_pane_action_seqs: initial_pane_seqs,
@@ -677,8 +697,47 @@ impl WatchdogApp {
         });
     }
 
+    fn prune_expired_animations(&mut self) -> bool {
+        let now = Instant::now();
+        let had_win = self.window_nudge_until.is_some();
+        let had_nudge = !self.pane_nudge_seqs.is_empty();
+        let had_move = !self.pane_move_anims.is_empty();
+        self.pane_nudge_seqs.retain(|_, (_, until)| *until > now);
+        self.pane_move_anims.retain(|_, (_, _, until)| *until > now);
+        if self.window_nudge_until.is_some_and(|u| u <= now) {
+            self.window_nudge_until = None;
+        }
+        (had_win && self.window_nudge_until.is_none())
+            || (had_nudge && self.pane_nudge_seqs.is_empty())
+            || (had_move && self.pane_move_anims.is_empty())
+    }
+
+    /// Adaptive interval for refreshing relative timestamps ("刚刚" / "3分钟前") without unnecessary redraws.
+    fn relative_clock_tick_interval(&self) -> Option<Duration> {
+        if !matches!(self.active_tab, ActiveTab::Dashboard | ActiveTab::Audit) {
+            return None;
+        }
+        let now = chrono::Utc::now();
+        let newest_age_sec = self
+            .snapshot
+            .panes
+            .iter()
+            .filter_map(|p| p.last_action_at)
+            .chain(self.snapshot.audit_records.iter().rev().take(30).map(|r| r.timestamp))
+            .map(|ts| now.signed_duration_since(ts).num_seconds().max(0))
+            .min()?;
+        if newest_age_sec < 60 {
+            Some(Duration::from_secs(2))
+        } else if newest_age_sec < 3600 {
+            Some(Duration::from_secs(15))
+        } else {
+            None
+        }
+    }
+
     fn refresh_snapshot(&mut self) {
         self.snapshot = self.engine.lock().unwrap().snapshot();
+        self.last_state_version = self.snapshot.state_version;
         let now = Instant::now();
         if self.snapshot.action_seq > self.last_seen_action_seq {
             self.last_seen_action_seq = self.snapshot.action_seq;
@@ -1554,18 +1613,18 @@ impl WatchdogApp {
             .unwrap_or_else(|| tr(lang, "尚未扫描", "Not yet scanned").to_string());
 
         let recent_audits: Vec<&AuditRecord> =
-            self.snapshot.audit_records.iter().rev().take(8).collect();
+            self.snapshot.audit_records.iter().rev().take(30).collect();
 
         div()
-            .id("dashboard-scroll")
             .size_full()
-            .overflow_scroll()
+            .overflow_hidden()
             .p_4()
             .flex()
             .flex_col()
             .gap_4()
             .child(
                 div()
+                    .flex_shrink_0()
                     .flex()
                     .flex_row()
                     .gap_3()
@@ -1603,7 +1662,7 @@ impl WatchdogApp {
                     )),
             )
             .child(
-                section_card(
+                div().flex_shrink_0().child(section_card(
                     tr(lang, "实时 Pane 状态监控", "Live Pane Status"),
                     div()
                         .flex()
@@ -1836,31 +1895,54 @@ impl WatchdogApp {
                                 })
                                 .collect()
                         }),
-                ),
+                )),
             )
             .child(
-                section_card(
-                    tr(lang, "最近审计动态", "Recent Audit Activity"),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .children(if recent_audits.is_empty() {
-                            vec![
-                                div()
-                                    .p_2()
-                                    .text_sm()
-                                    .text_color(rgb(0x94a3b8))
-                                    .child(tr(lang, "暂无审计记录", "No audit records yet"))
-                                    .into_any_element(),
-                            ]
-                        } else {
-                            recent_audits
-                                .into_iter()
-                                .map(|rec| audit_row(rec, lang).into_any_element())
-                                .collect()
-                        }),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x0b1220))
+                    .border_1()
+                    .border_color(rgb(0x1e293b))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(0xf1f5f9))
+                            .child(tr(lang, "最近审计动态", "Recent Audit Activity")),
+                    )
+                    .child(
+                        div()
+                            .id("recent-audit-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(if recent_audits.is_empty() {
+                                vec![
+                                    div()
+                                        .p_2()
+                                        .text_sm()
+                                        .text_color(rgb(0x94a3b8))
+                                        .child(tr(lang, "暂无审计记录", "No audit records yet"))
+                                        .into_any_element(),
+                                ]
+                            } else {
+                                recent_audits
+                                    .into_iter()
+                                    .map(|rec| audit_row(rec, lang).into_any_element())
+                                    .collect()
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -2954,24 +3036,7 @@ impl WatchdogApp {
                 AuditFilter::Skipped => r.result == AuditResult::Skipped,
                 AuditFilter::Failure => r.result == AuditResult::Failure,
             })
-            .filter(|r| {
-                if query.is_empty() {
-                    return true;
-                }
-                let hay = format!(
-                    "{} {} {} {} {} {} {} {}",
-                    r.pane,
-                    r.agent,
-                    r.status,
-                    r.rule_id.as_deref().unwrap_or(""),
-                    r.rule_name.as_deref().unwrap_or(""),
-                    r.match_summary,
-                    r.action_summary,
-                    r.detail
-                )
-                .to_lowercase();
-                hay.contains(&query)
-            })
+            .filter(|r| query.is_empty() || audit_record_matches_lower_query(r, &query))
             .take(200)
             .collect();
 
@@ -3046,7 +3111,7 @@ impl WatchdogApp {
                         0x7f1d1d,
                         cx.listener(|app, _, _, cx| {
                             let lang = app.lang();
-                            let _ = app.engine.lock().unwrap().audit_store.clear();
+                            let _ = app.engine.lock().unwrap().clear_audit_logs();
                             app.refresh_snapshot();
                             app.set_banner(
                                 false,
@@ -3573,6 +3638,33 @@ fn kpi_card(
                 .truncate()
                 .child(subtitle.into()),
         )
+}
+
+fn str_contains_lower_query(hay: &str, lower_query: &str) -> bool {
+    if hay.is_ascii() && lower_query.is_ascii() {
+        let h = hay.as_bytes();
+        let q = lower_query.as_bytes();
+        if q.len() > h.len() {
+            return false;
+        }
+        return h.windows(q.len()).any(|w| w.eq_ignore_ascii_case(q));
+    }
+    hay.to_lowercase().contains(lower_query)
+}
+
+fn audit_record_matches_lower_query(rec: &AuditRecord, lower_query: &str) -> bool {
+    [
+        rec.pane.as_str(),
+        rec.agent.as_str(),
+        rec.status.as_str(),
+        rec.rule_id.as_deref().unwrap_or(""),
+        rec.rule_name.as_deref().unwrap_or(""),
+        rec.match_summary.as_str(),
+        rec.action_summary.as_str(),
+        rec.detail.as_str(),
+    ]
+    .into_iter()
+    .any(|field| str_contains_lower_query(field, lower_query))
 }
 
 fn section_card(title: impl Into<SharedString>, body: impl IntoElement) -> impl IntoElement {

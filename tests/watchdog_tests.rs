@@ -674,3 +674,94 @@ fn test_snapshot_panes_sorted_by_last_status_change_time() {
     let order2: Vec<&str> = snap2.panes.iter().map(|p| p.pane.as_str()).collect();
     assert_eq!(order2, vec!["10", "1", "2"]);
 }
+
+#[test]
+fn test_cooldown_skip_schedules_recheck_and_executes_without_waiting_poll() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path());
+    let mut engine = WatchdogEngine::initialize(paths, false).unwrap();
+
+    // Use a 1s cooldown rule so test runs fast while proving due-recheck behavior.
+    engine.rules_file.rules.iter_mut().for_each(|r| {
+        if r.id == "approve-yes" {
+            r.cooldown_sec = 1;
+        }
+    });
+
+    let blocked_agent = AgentInfo {
+        pane: "1".into(),
+        agent: "codex".into(),
+        status: "blocked".into(),
+        name: None,
+        cwd: None,
+    };
+    let working_agent = AgentInfo {
+        pane: "1".into(),
+        agent: "codex".into(),
+        status: "working".into(),
+        name: None,
+        cwd: None,
+    };
+
+    let (client, state) = MockLuvusClient::new(
+        vec![blocked_agent.clone()],
+        vec![("1", "› 1. Yes, proceed")],
+    );
+
+    // First blocked transition executes enter immediately.
+    engine.process_agent_info(&client, &blocked_agent, false);
+    assert_eq!(state.lock().unwrap().sent_keys.len(), 1);
+
+    // Quick cycle working -> blocked within cooldown skips and schedules recheck.
+    engine.process_agent_info(&client, &working_agent, false);
+    engine.process_agent_info(&client, &blocked_agent, false);
+    assert_eq!(state.lock().unwrap().sent_keys.len(), 1);
+    assert_eq!(engine.process_due_rechecks(&client, false), 0);
+
+    // Wait just past cooldown (1.05s) without calling scan_once; recheck executes enter!
+    std::thread::sleep(std::time::Duration::from_millis(1120));
+    assert_eq!(engine.process_due_rechecks(&client, false), 1);
+    assert_eq!(state.lock().unwrap().sent_keys.len(), 2);
+}
+
+#[test]
+fn test_engine_session_kpi_counters_start_at_zero_and_count_current_run() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path());
+
+    {
+        let mut eng = WatchdogEngine::initialize(paths.clone(), false).unwrap();
+        let (ok_client, _) = MockLuvusClient::new(
+            vec![AgentInfo {
+                pane: "1".into(),
+                agent: "codex".into(),
+                status: "blocked".into(),
+                name: None,
+                cwd: None,
+            }],
+            vec![("1", "› 1. Yes, proceed")],
+        );
+        eng.scan_once(&ok_client, true).unwrap();
+        eng.reset_pane_continuous("1");
+        eng.rules_file.rules.iter_mut().for_each(|r| {
+            r.cooldown_sec = 0;
+            r.dedupe.strategy = DedupeStrategy::None;
+        });
+        eng.save_rules(eng.rules_file.clone()).unwrap();
+        eng.scan_once(&ok_client, false).unwrap();
+        assert_eq!(eng.total_dry_runs, 1);
+        assert_eq!(eng.total_actions, 1);
+        assert_eq!(eng.rule_hit_counts.get("approve-yes").copied(), Some(2));
+    }
+
+    // Re-initializing starts a new session with zeroed KPI counters while keeping audit history.
+    let mut next_session = WatchdogEngine::initialize(paths, false).unwrap();
+    assert_eq!(next_session.total_dry_runs, 0);
+    assert_eq!(next_session.total_actions, 0);
+    assert_eq!(next_session.total_errors, 0);
+    assert!(next_session.rule_hit_counts.is_empty());
+    assert_eq!(next_session.audit_store.records().len(), 2);
+
+    next_session.clear_audit_logs().unwrap();
+    assert!(next_session.audit_store.records().is_empty());
+}

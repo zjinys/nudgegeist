@@ -177,10 +177,10 @@ impl UnixSocketUhpClient {
             }
         }
 
-        // Short read timeout allows the background loop to poll config changes & stop signal cleanly.
+        // Short read timeout allows the background loop to process pending cooldown rechecks & stop signal promptly.
         reader
             .get_ref()
-            .set_read_timeout(Some(Duration::from_millis(500)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .ok();
         Ok(reader)
     }

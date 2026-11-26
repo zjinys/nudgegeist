@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
@@ -125,7 +126,7 @@ impl AuditRecord {
 #[derive(Debug, Clone)]
 pub struct AuditStore {
     path: PathBuf,
-    records: Vec<AuditRecord>,
+    records: Arc<Vec<AuditRecord>>,
     max_in_memory: usize,
 }
 
@@ -147,7 +148,7 @@ impl AuditStore {
         }
         let mut store = Self {
             path,
-            records,
+            records: Arc::new(records),
             max_in_memory: 2000,
         };
         if retention_days > 0 {
@@ -155,7 +156,7 @@ impl AuditStore {
         }
         if store.records.len() > store.max_in_memory {
             let drain = store.records.len() - store.max_in_memory;
-            store.records.drain(0..drain);
+            Arc::make_mut(&mut store.records).drain(0..drain);
         }
         store
     }
@@ -173,10 +174,11 @@ impl AuditStore {
             .append(true)
             .open(&self.path)?;
         writeln!(file, "{line}")?;
-        self.records.push(record);
-        if self.records.len() > self.max_in_memory {
-            let drain = self.records.len() - self.max_in_memory;
-            self.records.drain(0..drain);
+        let vec = Arc::make_mut(&mut self.records);
+        vec.push(record);
+        if vec.len() > self.max_in_memory {
+            let drain = vec.len() - self.max_in_memory;
+            vec.drain(0..drain);
         }
         Ok(())
     }
@@ -185,14 +187,20 @@ impl AuditStore {
         &self.records
     }
 
+    /// Cheap O(1) handle for UI snapshots without deep-cloning up to 2000 audit records.
+    pub fn records_arc(&self) -> Arc<Vec<AuditRecord>> {
+        Arc::clone(&self.records)
+    }
+
     pub fn prune_older_than(&mut self, days: u32) -> Result<usize> {
         let cutoff = Utc::now() - Duration::days(days as i64);
-        let before = self.records.len();
-        self.records.retain(|r| r.timestamp >= cutoff);
-        let removed = before.saturating_sub(self.records.len());
+        let vec = Arc::make_mut(&mut self.records);
+        let before = vec.len();
+        vec.retain(|r| r.timestamp >= cutoff);
+        let removed = before.saturating_sub(vec.len());
         if removed > 0 && self.path.exists() {
             let mut out = String::new();
-            for r in &self.records {
+            for r in vec.iter() {
                 out.push_str(&serde_json::to_string(r)?);
                 out.push('\n');
             }
@@ -202,7 +210,7 @@ impl AuditStore {
     }
 
     pub fn clear(&mut self) -> Result<()> {
-        self.records.clear();
+        Arc::make_mut(&mut self.records).clear();
         if self.path.exists() {
             fs::write(&self.path, "")?;
         }

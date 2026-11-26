@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::audit::{AuditRecord, AuditResult, AuditStore, SkipReason};
 use crate::config::{
     ActionType, AppPaths, DedupeStrategy, MatchRegion, MatchSource, ReviewStatus, Rule, RulesFile,
-    TransportMode, UiLanguage, WatchdogConfig, compile_regex, load_or_init_config,
+    TransportMode, UiLanguage, WatchdogConfig, compile_regex_cached, load_or_init_config,
     resolve_luvus_socket_path, save_json_atomic, validate_config, validate_rules_file,
 };
 use crate::luvus::{
@@ -98,7 +98,7 @@ pub struct EngineSnapshot {
     pub paused_rules: HashSet<String>,
     pub rule_hit_counts: HashMap<String, u64>,
     pub rule_last_hit: HashMap<String, DateTime<Utc>>,
-    pub audit_records: Vec<AuditRecord>,
+    pub audit_records: Arc<Vec<AuditRecord>>,
     pub events_connected: bool,
     pub active_transport: String,
     pub last_config_error: Option<String>,
@@ -108,6 +108,7 @@ pub struct EngineSnapshot {
     pub total_dry_runs: u64,
     pub total_errors: u64,
     pub action_seq: u64,
+    pub state_version: u64,
 }
 
 pub fn normalize_text(text: &str) -> String {
@@ -225,7 +226,7 @@ pub fn evaluate_rules_stateless(
 
     let mut non_retryable_hit = None;
     for pat in &cfg.non_retryable_regexes {
-        if let Ok(re) = compile_regex(pat, true)
+        if let Ok(re) = compile_regex_cached(pat, true)
             && let Some(m) = re.find(&error_region)
         {
             non_retryable_hit = Some(m.as_str().trim().to_string());
@@ -323,7 +324,7 @@ pub fn evaluate_rules_stateless(
         // Evaluate noneRegex first.
         let mut none_hit = None;
         for pat in &rule.match_cfg.none_regex {
-            if let Ok(re) = compile_regex(pat, ci)
+            if let Ok(re) = compile_regex_cached(pat, ci)
                 && let Some(m) = re.find(&region_text)
             {
                 none_hit = Some(m.as_str().trim().to_string());
@@ -351,7 +352,7 @@ pub fn evaluate_rules_stateless(
         let mut all_failed_pat = None;
         let mut first_all_snippet = None;
         for pat in &rule.match_cfg.all_regex {
-            match compile_regex(pat, ci) {
+            match compile_regex_cached(pat, ci) {
                 Ok(re) => {
                     if let Some(m) = re.find(&region_text) {
                         if first_all_snippet.is_none() {
@@ -395,7 +396,7 @@ pub fn evaluate_rules_stateless(
             any_hit = first_all_snippet.clone();
         } else {
             for pat in &rule.match_cfg.any_regex {
-                if let Ok(re) = compile_regex(pat, ci)
+                if let Ok(re) = compile_regex_cached(pat, ci)
                     && let Some(m) = re.find(&region_text)
                 {
                     any_hit = Some(m.as_str().trim().to_string());
@@ -423,7 +424,7 @@ pub fn evaluate_rules_stateless(
         // Evaluate guards.noneRegex.
         let mut guard_hit = None;
         for pat in &rule.guards.none_regex {
-            if let Ok(re) = compile_regex(pat, false)
+            if let Ok(re) = compile_regex_cached(pat, false)
                 && let Some(m) = re.find(&region_text)
             {
                 guard_hit = Some(m.as_str().trim().to_string());
@@ -558,6 +559,8 @@ pub struct WatchdogEngine {
     pub rule_last_hit: HashMap<String, DateTime<Utc>>,
     cooldowns: HashMap<String, Instant>,
     dedupe_cache: HashMap<(String, String, String), Instant>,
+    /// Delayed per-pane rechecks scheduled after cooldown skip or transient status/output race.
+    pending_rechecks: HashMap<String, (AgentInfo, Instant, bool)>,
     config_mtime: Option<SystemTime>,
     rules_mtime: Option<SystemTime>,
     pub events_connected: bool,
@@ -569,6 +572,7 @@ pub struct WatchdogEngine {
     pub total_dry_runs: u64,
     pub total_errors: u64,
     pub action_seq: u64,
+    pub state_version: u64,
 }
 
 fn pane_sort_key(pane: &str) -> (u8, u64, &str) {
@@ -605,6 +609,7 @@ impl WatchdogEngine {
             rule_last_hit: HashMap::new(),
             cooldowns: HashMap::new(),
             dedupe_cache: HashMap::new(),
+            pending_rechecks: HashMap::new(),
             config_mtime,
             rules_mtime,
             events_connected: false,
@@ -616,7 +621,19 @@ impl WatchdogEngine {
             total_dry_runs: 0,
             total_errors: 0,
             action_seq: 0,
+            state_version: 1,
         })
+    }
+
+    pub fn clear_audit_logs(&mut self) -> Result<()> {
+        self.audit_store.clear()?;
+        self.total_actions = 0;
+        self.total_dry_runs = 0;
+        self.total_errors = 0;
+        self.rule_hit_counts.clear();
+        self.rule_last_hit.clear();
+        self.state_version = self.state_version.wrapping_add(1);
+        Ok(())
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -633,7 +650,7 @@ impl WatchdogEngine {
             paused_rules: self.paused_rules.clone(),
             rule_hit_counts: self.rule_hit_counts.clone(),
             rule_last_hit: self.rule_last_hit.clone(),
-            audit_records: self.audit_store.records().to_vec(),
+            audit_records: self.audit_store.records_arc(),
             events_connected: self.events_connected,
             active_transport: self.active_transport.clone(),
             last_config_error: self.last_config_error.clone(),
@@ -643,6 +660,7 @@ impl WatchdogEngine {
             total_dry_runs: self.total_dry_runs,
             total_errors: self.total_errors,
             action_seq: self.action_seq,
+            state_version: self.state_version,
         }
     }
 
@@ -722,10 +740,16 @@ impl WatchdogEngine {
         }
 
         if errors.is_empty() {
-            self.last_config_error = None;
+            if self.last_config_error.take().is_some() {
+                self.state_version = self.state_version.wrapping_add(1);
+            }
         } else {
             self.last_config_error = Some(errors.join(" | "));
             self.total_errors += 1;
+            self.state_version = self.state_version.wrapping_add(1);
+        }
+        if changed {
+            self.state_version = self.state_version.wrapping_add(1);
         }
         changed
     }
@@ -736,12 +760,20 @@ impl WatchdogEngine {
         save_json_atomic(&self.paths.config_file(), &cfg)
             .map_err(|e| vec![format!("保存 config.json 失败: {e}")])?;
         self.config = cfg;
-        self.active_transport = DynamicLuvusClient::from_config(&self.config).transport_label();
+        let label = DynamicLuvusClient::from_config(&self.config).transport_label();
+        if self.active_transport != label {
+            self.active_transport = label;
+        }
         self.config_mtime = fs::metadata(self.paths.config_file())
             .and_then(|m| m.modified())
             .ok();
         self.last_config_error = None;
+        self.state_version = self.state_version.wrapping_add(1);
         Ok(())
+    }
+
+    pub fn bump_version(&mut self) {
+        self.state_version = self.state_version.wrapping_add(1);
     }
 
     pub fn save_rules(&mut self, rules_file: RulesFile) -> std::result::Result<(), Vec<String>> {
@@ -753,6 +785,7 @@ impl WatchdogEngine {
             .and_then(|m| m.modified())
             .ok();
         self.last_config_error = None;
+        self.state_version = self.state_version.wrapping_add(1);
         Ok(())
     }
 
@@ -783,6 +816,7 @@ impl WatchdogEngine {
     pub fn toggle_pane_pause(&mut self, pane: &str) {
         if let Some(st) = self.panes.get_mut(pane) {
             st.manual_paused = !st.manual_paused;
+            self.state_version = self.state_version.wrapping_add(1);
         }
     }
 
@@ -791,6 +825,7 @@ impl WatchdogEngine {
             st.continuous_count = 0;
             st.continuous_paused = false;
             st.non_retryable_notified = false;
+            self.state_version = self.state_version.wrapping_add(1);
         }
         self.dedupe_cache.retain(|(p, _, _), _| p != pane);
     }
@@ -799,6 +834,7 @@ impl WatchdogEngine {
         if !self.paused_rules.remove(rule_id) {
             self.paused_rules.insert(rule_id.to_string());
         }
+        self.state_version = self.state_version.wrapping_add(1);
     }
 
     pub fn scan_once(&mut self, client: &dyn LuvusClient, cli_dry_run: bool) -> Result<()> {
@@ -810,11 +846,13 @@ impl WatchdogEngine {
                 for info in agents {
                     self.process_agent_info(client, &info, cli_dry_run);
                 }
+                self.state_version = self.state_version.wrapping_add(1);
                 Ok(())
             }
             Err(err) => {
                 self.last_luvus_error = Some(err.to_string());
                 self.total_errors += 1;
+                self.state_version = self.state_version.wrapping_add(1);
                 Err(err)
             }
         }
@@ -826,12 +864,54 @@ impl WatchdogEngine {
         info: &AgentInfo,
         cli_dry_run: bool,
     ) {
+        self.process_agent_info_inner(client, info, cli_dry_run, true);
+    }
+
+    pub fn process_due_rechecks(&mut self, client: &dyn LuvusClient, cli_dry_run: bool) -> usize {
+        let now = Instant::now();
+        let due_panes: Vec<String> = self
+            .pending_rechecks
+            .iter()
+            .filter_map(|(pane, (_, due_at, _))| (*due_at <= now).then_some(pane.clone()))
+            .collect();
+        let mut count = 0;
+        for pane in due_panes {
+            let Some((mut info, _, is_nomatch_retry)) = self.pending_rechecks.remove(&pane) else {
+                continue;
+            };
+            if let Some(st) = self.panes.get(&pane) {
+                if st.status.eq_ignore_ascii_case("working")
+                    || st.manual_paused
+                    || st.continuous_paused
+                {
+                    continue;
+                }
+                info.status = st.status.clone();
+                info.agent = st.agent.clone();
+            }
+            if self.config.paused_all {
+                continue;
+            }
+            count += 1;
+            self.process_agent_info_inner(client, &info, cli_dry_run, !is_nomatch_retry);
+        }
+        count
+    }
+
+    fn process_agent_info_inner(
+        &mut self,
+        client: &dyn LuvusClient,
+        info: &AgentInfo,
+        cli_dry_run: bool,
+        allow_nomatch_retry: bool,
+    ) {
         if !scope_matches(&self.config.allowed_panes, &info.pane)
             || !scope_matches(&self.config.allowed_agents, &info.agent)
         {
             return;
         }
 
+        let is_new_pane = !self.panes.contains_key(&info.pane);
         let audit_store = &self.audit_store;
         let state = self.panes.entry(info.pane.clone()).or_insert_with(|| {
             let mut st = PaneRuntimeState::new(&info.pane, &info.agent, &info.status);
@@ -855,10 +935,12 @@ impl WatchdogEngine {
         state.agent = info.agent.clone();
         state.last_checked = Some(Utc::now());
 
-        if state.status != info.status {
+        let status_changed = state.status != info.status;
+        if status_changed {
             state.status = info.status.clone();
             state.last_status_change = Some(Utc::now());
         }
+        let mut reset_occurred = false;
 
         if info.status.eq_ignore_ascii_case("working") {
             if state.continuous_count > 0 || state.continuous_paused || state.non_retryable_notified
@@ -866,13 +948,23 @@ impl WatchdogEngine {
                 state.continuous_count = 0;
                 state.continuous_paused = false;
                 state.non_retryable_notified = false;
+                reset_occurred = true;
                 let pane_id = info.pane.clone();
                 self.dedupe_cache.retain(|(p, _, _), _| p != &pane_id);
+            }
+            self.pending_rechecks.remove(&info.pane);
+            if is_new_pane || status_changed || reset_occurred {
+                self.state_version = self.state_version.wrapping_add(1);
             }
             return;
         }
 
+        if is_new_pane || status_changed {
+            self.state_version = self.state_version.wrapping_add(1);
+        }
+
         if self.config.paused_all || state.manual_paused {
+            self.pending_rechecks.remove(&info.pane);
             return;
         }
 
@@ -899,6 +991,7 @@ impl WatchdogEngine {
             Err(err) => {
                 self.total_errors += 1;
                 self.last_luvus_error = Some(err.to_string());
+                self.state_version = self.state_version.wrapping_add(1);
                 return;
             }
         };
@@ -945,7 +1038,7 @@ impl WatchdogEngine {
                             self.config.global_dry_run || cli_dry_run,
                             detail.clone(),
                         );
-                        let _ = self.audit_store.append(rec, redact);
+                        self.append_audit_and_bump(rec, redact);
                     }
                 }
                 FinalDecision::Skipped(reason, detail) => {
@@ -970,10 +1063,19 @@ impl WatchdogEngine {
                             self.config.global_dry_run || cli_dry_run,
                             detail.clone(),
                         );
-                        let _ = self.audit_store.append(rec, redact);
+                        self.append_audit_and_bump(rec, redact);
                     }
                 }
-                FinalDecision::NoMatch => {}
+                FinalDecision::NoMatch => {
+                    // Status-change events can briefly lead terminal prompt rendering; retry once after 350ms.
+                    if allow_nomatch_retry && status_changed {
+                        self.pending_rechecks.entry(info.pane.clone()).or_insert((
+                            info.clone(),
+                            now + Duration::from_millis(350),
+                            true,
+                        ));
+                    }
+                }
                 FinalDecision::Execute(_) | FinalDecision::DryRun(_) => {}
             }
             return;
@@ -1009,7 +1111,7 @@ impl WatchdogEngine {
                 false,
                 "规则已被人工暂停",
             );
-            let _ = self.audit_store.append(rec, redact);
+            self.append_audit_and_bump(rec, redact);
             return;
         }
 
@@ -1037,16 +1139,20 @@ impl WatchdogEngine {
                 self.config.global_dry_run || cli_dry_run,
                 format!("窗口 {}s 内重复命中去重跳过", rule.dedupe.window_sec),
             );
-            let _ = self.audit_store.append(rec, redact);
+            self.append_audit_and_bump(rec, redact);
             return;
         }
 
-        // Cooldown check.
+        // Cooldown check: if skipped during cooldown, schedule a recheck right after cooldown expires
+        // instead of waiting up to scan_interval_sec when no further status-change event arrives.
         let cd_key = format!("{}:{}", info.pane, rule.id);
         if rule.cooldown_sec > 0
-            && let Some(prev) = self.cooldowns.get(&cd_key)
-            && now.duration_since(*prev).as_secs() < rule.cooldown_sec
+            && let Some(prev) = self.cooldowns.get(&cd_key).copied()
+            && now.duration_since(prev).as_secs() < rule.cooldown_sec
         {
+            let due_at = prev + Duration::from_secs(rule.cooldown_sec) + Duration::from_millis(50);
+            self.pending_rechecks
+                .insert(info.pane.clone(), (info.clone(), due_at, false));
             let rec = AuditRecord::new(
                 &info.pane,
                 &info.agent,
@@ -1061,7 +1167,7 @@ impl WatchdogEngine {
                 self.config.global_dry_run || cli_dry_run,
                 format!("规则冷却中 ({}s)", rule.cooldown_sec),
             );
-            let _ = self.audit_store.append(rec, redact);
+            self.append_audit_and_bump(rec, redact);
             return;
         }
 
@@ -1090,7 +1196,7 @@ impl WatchdogEngine {
                         self.config.global_dry_run || cli_dry_run,
                         format!("连续自动处理已达上限 {effective_max} 次，已暂停该 pane"),
                     );
-                    let _ = self.audit_store.append(rec, redact);
+                    self.append_audit_and_bump(rec, redact);
                 }
                 return;
             }
@@ -1102,6 +1208,7 @@ impl WatchdogEngine {
             || rule.review_status == ReviewStatus::PendingReview;
 
         if effective_dry_run {
+            self.pending_rechecks.remove(&info.pane);
             self.cooldowns.insert(cd_key, now);
             if let Some(key) = dedupe_key {
                 self.mark_dedupe(key, now);
@@ -1130,7 +1237,7 @@ impl WatchdogEngine {
                 true,
                 "Dry-Run 模式：仅记录计划动作，未调用 luvus",
             );
-            let _ = self.audit_store.append(rec, redact);
+            self.append_audit_and_bump(rec, redact);
             return;
         }
 
@@ -1145,6 +1252,7 @@ impl WatchdogEngine {
 
         match exec_res {
             Ok(()) => {
+                self.pending_rechecks.remove(&info.pane);
                 self.cooldowns.insert(cd_key, now);
                 if let Some(key) = dedupe_key {
                     self.mark_dedupe(key, now);
@@ -1173,7 +1281,8 @@ impl WatchdogEngine {
                     false,
                     "动作执行成功",
                 );
-                let _ = self.audit_store.append(rec, redact);
+                self.append_audit_and_bump(rec, redact);
+                self.state_version = self.state_version.wrapping_add(1);
             }
             Err(err) => {
                 self.total_errors += 1;
@@ -1192,8 +1301,15 @@ impl WatchdogEngine {
                     false,
                     format!("执行失败: {err}"),
                 );
-                let _ = self.audit_store.append(rec, redact);
+                self.append_audit_and_bump(rec, redact);
+                self.state_version = self.state_version.wrapping_add(1);
             }
+        }
+    }
+
+    fn append_audit_and_bump(&mut self, rec: AuditRecord, redact: bool) {
+        if self.audit_store.append(rec, redact).is_ok() {
+            self.state_version = self.state_version.wrapping_add(1);
         }
     }
 
@@ -1249,58 +1365,75 @@ pub fn spawn_engine_loop(
                 let sock_client = UnixSocketUhpClient::new(&sock_path);
                 match sock_client.subscribe_events(last_sequence) {
                     Ok(mut reader) => {
+                        let label = format!("UHP Socket ({})", sock_path.display());
                         {
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = true;
-                            eng.active_transport = format!("UHP Socket ({})", sock_path.display());
+                            if eng.active_transport != label {
+                                eng.active_transport = label;
+                            }
                             eng.last_luvus_error = None;
+                            eng.state_version = eng.state_version.wrapping_add(1);
                         }
                         let mut last_poll = Instant::now();
+                        let mut last_maintenance = Instant::now();
+                        let mut last_reload = Instant::now();
+                        let mut fast_timeout = false;
+                        let _ = reader
+                            .get_ref()
+                            .set_read_timeout(Some(Duration::from_millis(1000)));
                         let mut line = String::new();
                         while !stop.load(Ordering::Relaxed) {
                             line.clear();
-                            match reader.read_line(&mut line) {
+                            let read_res = reader.read_line(&mut line);
+                            let force_maint = match read_res {
                                 Ok(0) => break, // EOF -> reconnect
-                                Ok(_) => {
-                                    handle_event_stream_line(
-                                        &shared,
-                                        &line,
-                                        &mut last_sequence,
-                                        cli_dry_run,
-                                    );
-                                }
+                                Ok(_) => handle_event_stream_line(
+                                    &shared,
+                                    &line,
+                                    &mut last_sequence,
+                                    cli_dry_run,
+                                ),
                                 Err(e)
                                     if e.kind() == std::io::ErrorKind::WouldBlock
-                                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    true
+                                }
                                 Err(e) => {
                                     let mut eng = shared.lock().unwrap();
                                     eng.last_luvus_error = Some(format!("UHP 事件流读取错误: {e}"));
+                                    eng.state_version = eng.state_version.wrapping_add(1);
                                     break;
                                 }
-                            }
-
-                            let (scan_interval, transport_changed) = {
-                                let mut eng = shared.lock().unwrap();
-                                eng.hot_reload_if_changed();
-                                let cur_sock = resolve_luvus_socket_path(&eng.config);
-                                let changed = eng.config.transport_mode == TransportMode::Cli
-                                    || cur_sock != sock_path;
-                                (eng.config.scan_interval_sec, changed)
                             };
-                            if transport_changed {
-                                break;
-                            }
-                            if scan_interval > 0 && last_poll.elapsed().as_secs() >= scan_interval {
-                                let mut eng = shared.lock().unwrap();
-                                let c = DynamicLuvusClient::from_config(&eng.config);
-                                eng.active_transport = c.transport_label();
-                                let _ = eng.scan_once(&c, cli_dry_run);
-                                last_poll = Instant::now();
+
+                            if force_maint || last_maintenance.elapsed() >= Duration::from_millis(200) {
+                                last_maintenance = Instant::now();
+                                let (changed, want_fast) = run_event_loop_tick(
+                                    &shared,
+                                    cli_dry_run,
+                                    &mut last_poll,
+                                    &mut last_reload,
+                                    Some(&sock_path),
+                                    None,
+                                );
+                                if changed {
+                                    break;
+                                }
+                                if want_fast != fast_timeout {
+                                    fast_timeout = want_fast;
+                                    let ms = if fast_timeout { 200 } else { 1000 };
+                                    let _ = reader
+                                        .get_ref()
+                                        .set_read_timeout(Some(Duration::from_millis(ms)));
+                                }
                             }
                         }
                         {
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = false;
+                            eng.state_version = eng.state_version.wrapping_add(1);
                         }
                         continue;
                     }
@@ -1309,7 +1442,10 @@ pub fn spawn_engine_loop(
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = false;
                             eng.last_luvus_error = Some(err.to_string());
+                            eng.state_version = eng.state_version.wrapping_add(1);
                         }
+                        // Clear sequence cursor if reconnect failed (e.g., stale/overflowed after_sequence).
+                        last_sequence = None;
                         sleep_with_stop(&stop, reconnect_delay.min(cfg_snapshot.scan_interval_sec.max(1)));
                         continue;
                     }
@@ -1320,11 +1456,15 @@ pub fn spawn_engine_loop(
                 let cli_client = RealLuvusClient::new(&cfg_snapshot.luvus_bin);
                 match cli_client.spawn_events_process() {
                     Ok(mut child) => {
+                        let label = format!("CLI 子进程 ({})", cfg_snapshot.luvus_bin);
                         {
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = true;
-                            eng.active_transport = format!("CLI 子进程 ({})", cfg_snapshot.luvus_bin);
+                            if eng.active_transport != label {
+                                eng.active_transport = label;
+                            }
                             eng.last_luvus_error = None;
+                            eng.state_version = eng.state_version.wrapping_add(1);
                         }
 
                         let stdout = child.stdout.take();
@@ -1341,43 +1481,36 @@ pub fn spawn_engine_loop(
                         }
 
                         let mut last_poll = Instant::now();
+                        let mut last_maintenance = Instant::now();
+                        let mut last_reload = Instant::now();
+                        let mut fast_timeout = false;
                         while !stop.load(Ordering::Relaxed) {
-                            match rx.recv_timeout(Duration::from_millis(500)) {
-                                Ok(line) => {
-                                    handle_event_stream_line(
-                                        &shared,
-                                        &line,
-                                        &mut last_sequence,
-                                        cli_dry_run,
-                                    );
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            let wait_ms = if fast_timeout { 200 } else { 1000 };
+                            let force_maint = match rx.recv_timeout(Duration::from_millis(wait_ms)) {
+                                Ok(line) => handle_event_stream_line(
+                                    &shared,
+                                    &line,
+                                    &mut last_sequence,
+                                    cli_dry_run,
+                                ),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
                                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            }
-
-                            let (scan_interval, transport_changed) = {
-                                let mut eng = shared.lock().unwrap();
-                                eng.hot_reload_if_changed();
-                                let cur_sock = resolve_luvus_socket_path(&eng.config);
-                                let switch_to_sock = cfg!(unix)
-                                    && match eng.config.transport_mode {
-                                        TransportMode::Socket => true,
-                                        TransportMode::Auto => cur_sock.exists(),
-                                        TransportMode::Cli => false,
-                                    };
-                                let changed = switch_to_sock
-                                    || eng.config.luvus_bin != cfg_snapshot.luvus_bin;
-                                (eng.config.scan_interval_sec, changed)
                             };
-                            if transport_changed {
-                                break;
-                            }
-                            if scan_interval > 0 && last_poll.elapsed().as_secs() >= scan_interval {
-                                let mut eng = shared.lock().unwrap();
-                                let c = DynamicLuvusClient::from_config(&eng.config);
-                                eng.active_transport = c.transport_label();
-                                let _ = eng.scan_once(&c, cli_dry_run);
-                                last_poll = Instant::now();
+
+                            if force_maint || last_maintenance.elapsed() >= Duration::from_millis(200) {
+                                last_maintenance = Instant::now();
+                                let (changed, want_fast) = run_event_loop_tick(
+                                    &shared,
+                                    cli_dry_run,
+                                    &mut last_poll,
+                                    &mut last_reload,
+                                    None,
+                                    Some(&cfg_snapshot.luvus_bin),
+                                );
+                                if changed {
+                                    break;
+                                }
+                                fast_timeout = want_fast;
                             }
                         }
 
@@ -1386,6 +1519,7 @@ pub fn spawn_engine_loop(
                         {
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = false;
+                            eng.state_version = eng.state_version.wrapping_add(1);
                         }
                     }
                     Err(err) => {
@@ -1393,6 +1527,7 @@ pub fn spawn_engine_loop(
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = false;
                             eng.last_luvus_error = Some(err.to_string());
+                            eng.state_version = eng.state_version.wrapping_add(1);
                         }
                         let wait_sec = if cfg_snapshot.scan_interval_sec > 0 {
                             reconnect_delay.min(cfg_snapshot.scan_interval_sec)
@@ -1410,14 +1545,68 @@ pub fn spawn_engine_loop(
     })
 }
 
+/// Periodic maintenance inside the event loop; returns `(transport_changed, has_pending_rechecks)`.
+fn run_event_loop_tick(
+    shared: &Arc<Mutex<WatchdogEngine>>,
+    cli_dry_run: bool,
+    last_poll: &mut Instant,
+    last_reload: &mut Instant,
+    connected_socket: Option<&std::path::Path>,
+    connected_cli_bin: Option<&str>,
+) -> (bool, bool) {
+    let mut eng = shared.lock().unwrap();
+    if last_reload.elapsed() >= Duration::from_secs(1) {
+        *last_reload = Instant::now();
+        eng.hot_reload_if_changed();
+    }
+    let cur_sock = resolve_luvus_socket_path(&eng.config);
+
+    let transport_changed = if let Some(sock_path) = connected_socket {
+        eng.config.transport_mode == TransportMode::Cli || cur_sock != sock_path
+    } else if let Some(bin) = connected_cli_bin {
+        let switch_to_sock = cfg!(unix)
+            && match eng.config.transport_mode {
+                TransportMode::Socket => true,
+                TransportMode::Auto => cur_sock.exists(),
+                TransportMode::Cli => false,
+            };
+        switch_to_sock || eng.config.luvus_bin != bin
+    } else {
+        false
+    };
+    if transport_changed {
+        return (true, false);
+    }
+
+    let need_client = !eng.pending_rechecks.is_empty()
+        || (eng.config.scan_interval_sec > 0 && last_poll.elapsed().as_secs() >= eng.config.scan_interval_sec);
+    if need_client {
+        let c = DynamicLuvusClient::from_config(&eng.config);
+        let label = c.transport_label();
+        if eng.active_transport != label {
+            eng.active_transport = label;
+            eng.state_version = eng.state_version.wrapping_add(1);
+        }
+        eng.process_due_rechecks(&c, cli_dry_run);
+
+        let scan_interval = eng.config.scan_interval_sec;
+        if scan_interval > 0 && last_poll.elapsed().as_secs() >= scan_interval {
+            let _ = eng.scan_once(&c, cli_dry_run);
+            *last_poll = Instant::now();
+        }
+    }
+    (false, !eng.pending_rechecks.is_empty())
+}
+
+/// Returns `true` when an actionable agent/resync event was processed.
 fn handle_event_stream_line(
     shared: &Arc<Mutex<WatchdogEngine>>,
     line: &str,
     last_sequence: &mut Option<u64>,
     cli_dry_run: bool,
-) {
+) -> bool {
     let Some(ev) = parse_luvus_event_line(line) else {
-        return;
+        return false;
     };
     match ev {
         LuvusEvent::AgentStatus {
@@ -1432,7 +1621,11 @@ fn handle_event_stream_line(
             let mut eng = shared.lock().unwrap();
             eng.hot_reload_if_changed();
             let c = DynamicLuvusClient::from_config(&eng.config);
-            eng.active_transport = c.transport_label();
+            let label = c.transport_label();
+            if eng.active_transport != label {
+                eng.active_transport = label;
+                eng.state_version = eng.state_version.wrapping_add(1);
+            }
             let info = AgentInfo {
                 pane,
                 agent,
@@ -1441,19 +1634,21 @@ fn handle_event_stream_line(
                 cwd: None,
             };
             eng.process_agent_info(&c, &info, cli_dry_run);
+            true
         }
         LuvusEvent::ResyncRequired { sequence } => {
-            if let Some(seq) = sequence {
-                *last_sequence = Some(seq);
-            }
+            let _ = sequence;
+            *last_sequence = None;
             let mut eng = shared.lock().unwrap();
             let c = DynamicLuvusClient::from_config(&eng.config);
             let _ = eng.scan_once(&c, cli_dry_run);
+            true
         }
         LuvusEvent::Other { sequence } => {
             if let Some(seq) = sequence {
                 *last_sequence = Some(seq);
             }
+            false
         }
     }
 }
