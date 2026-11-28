@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -15,12 +16,16 @@ use nudgegeist::config::{
     RuleDedupe, RuleGuards, RuleMatch, RulesFile, TransportMode, UiLanguage, WatchdogConfig,
     import_rules_json, load_or_init_config, save_json_atomic, validate_rule,
 };
-use nudgegeist::engine::{FinalDecision, WatchdogEngine, evaluate_rules_stateless};
+use nudgegeist::engine::{
+    FinalDecision, WatchdogEngine, evaluate_rules_stateless, parse_quota_reset_delay,
+};
 #[cfg(unix)]
 use nudgegeist::luvus::UnixSocketUhpClient;
 use nudgegeist::luvus::{
-    AgentInfo, DynamicLuvusClient, LuvusClient, LuvusEvent, parse_agent_list_json,
-    parse_luvus_event_line, parse_read_pane_json,
+    AgentInfo, DynamicLuvusClient, LuvusClient, LuvusEvent, detect_luvus_installation,
+    luvus_install_command_preview, parse_agent_list_json, parse_luvus_event_line,
+    parse_read_pane_json, parse_session_list_pipe_address, resolve_luvus_executable,
+    windows_pipe_name_from_socket_path,
 };
 use nudgegeist::ui::app::{APP_ICON_PNG, pane_status_colors, write_linux_desktop_files};
 use nudgegeist::ui::i18n::{pretty_time, tr};
@@ -224,6 +229,92 @@ fn test_guards_and_non_retryable_block_dangerous_actions() {
     assert!(matches!(
         retrying.final_decision,
         FinalDecision::Skipped(SkipReason::Retrying, _)
+    ));
+}
+
+#[test]
+fn test_claude_api_error_resend_placeholder_triggers_continue() {
+    let cfg = WatchdogConfig::default();
+    let rules = RulesFile::default().rules;
+
+    // Captured from a real pane: Claude exits with a 429, then shows a "Resend" input
+    // placeholder. That placeholder must not hide the error from the evaluated region,
+    // and the "API Usage Billing" status label must not be treated as a billing error.
+    let text = r#" ▐▛███▛█   Claude Code v2.1.327
+▝▜██████▀  Fable 5.2 · API Usage Billing
+❯ 你去看看 个人认知主循环路线图 这个proposal的完成情况
+
+● API Error: Request rejected (429) · Service Unavailable
+
+❯ Resend your message to try again
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent"#;
+
+    let report = evaluate_rules_stateless(text, "claude", "%6", "done", &rules, &cfg);
+    assert_eq!(
+        report.winning_rule_id.as_deref(),
+        Some("recover-transient-error")
+    );
+    assert!(report.non_retryable_hit.is_none());
+    assert!(matches!(report.final_decision, FinalDecision::Execute(_)));
+}
+
+#[test]
+fn test_api_usage_billing_label_does_not_suppress_transient_errors() {
+    let cfg = WatchdogConfig::default();
+    let rules = RulesFile::default().rules;
+
+    // No `❯` prompt in this read window, so the evaluated region falls back to the full text,
+    // including Claude's static status label. A bare `billing` pattern used to block the 429.
+    let label = evaluate_rules_stateless(
+        "▝▜██████▀  Fable 5.2 · API Usage Billing\n● API Error: Request rejected (429) · Service Unavailable",
+        "claude",
+        "%6",
+        "idle",
+        &rules,
+        &cfg,
+    );
+    assert!(label.non_retryable_hit.is_none());
+    assert_eq!(
+        label.winning_rule_id.as_deref(),
+        Some("recover-transient-error")
+    );
+    assert!(matches!(label.final_decision, FinalDecision::Execute(_)));
+
+    // A genuine billing failure must still block auto-continue.
+    let real_billing = evaluate_rules_stateless(
+        "● Billing hard limit reached. Please add credits to continue.",
+        "claude",
+        "%6",
+        "idle",
+        &rules,
+        &cfg,
+    );
+    assert!(real_billing.non_retryable_hit.is_some());
+    assert!(matches!(
+        real_billing.final_decision,
+        FinalDecision::Skipped(SkipReason::NonRetryable, _)
+    ));
+}
+
+#[test]
+fn test_individual_quota_reached_is_non_retryable() {
+    let cfg = WatchdogConfig::default();
+    let rules = RulesFile::default().rules;
+
+    // Antigravity shows an exhausted individual quota but its earlier log mentions rate
+    // limiting, which the recover rule matches. Quota exhaustion must win over that match.
+    let text = r#"○ Thought for 9.6s (API error response indicates rate limiting during proposal status check.)
+⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h8m25s.
+Error ID: 65d0fb86-a5e4-427d-b085-0642a461f736-249
+
+> 继续"#;
+
+    let report = evaluate_rules_stateless(text, "antigravity", "%7", "idle", &rules, &cfg);
+    assert!(report.non_retryable_hit.is_some());
+    assert!(report.winning_rule_id.is_none());
+    assert!(matches!(
+        report.final_decision,
+        FinalDecision::Skipped(SkipReason::NonRetryable, _)
     ));
 }
 
@@ -643,33 +734,34 @@ fn test_snapshot_panes_sorted_by_last_status_change_time() {
 
     // Pane 1 changes status from idle -> working: moves to the top
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let (client2, _) = MockLuvusClient::new(
-        vec![AgentInfo {
+    engine.process_agent_info(
+        &client,
+        &AgentInfo {
             pane: "1".into(),
             agent: "antigravity".into(),
             status: "working".into(),
             name: None,
             cwd: None,
-        }],
-        vec![],
+        },
+        true,
     );
-    engine.scan_once(&client2, true).unwrap();
     let snap1 = engine.snapshot();
     assert_eq!(snap1.panes[0].pane, "1");
 
     // Pane 10 changes status from idle -> blocked: moves above pane 1
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let (client3, _) = MockLuvusClient::new(
-        vec![AgentInfo {
+    let (client3, _) = MockLuvusClient::new(vec![], vec![("10", "no matching text")]);
+    engine.process_agent_info(
+        &client3,
+        &AgentInfo {
             pane: "10".into(),
             agent: "opencode".into(),
             status: "blocked".into(),
             name: None,
             cwd: None,
-        }],
-        vec![("10", "no matching text")],
+        },
+        true,
     );
-    engine.scan_once(&client3, true).unwrap();
     let snap2 = engine.snapshot();
     let order2: Vec<&str> = snap2.panes.iter().map(|p| p.pane.as_str()).collect();
     assert_eq!(order2, vec!["10", "1", "2"]);
@@ -764,4 +856,231 @@ fn test_engine_session_kpi_counters_start_at_zero_and_count_current_run() {
 
     next_session.clear_audit_logs().unwrap();
     assert!(next_session.audit_store.records().is_empty());
+}
+
+#[test]
+fn test_parse_quota_reset_delay_formats() {
+    assert_eq!(
+        parse_quota_reset_delay("Resets in 1h8m25s."),
+        Some(Duration::from_secs(4105))
+    );
+    assert_eq!(
+        parse_quota_reset_delay("resets in 8m"),
+        Some(Duration::from_secs(480))
+    );
+    assert_eq!(
+        parse_quota_reset_delay("Resets in 45s"),
+        Some(Duration::from_secs(45))
+    );
+    assert_eq!(
+        parse_quota_reset_delay("Individual quota reached. Resets in 1h 8m 25s."),
+        Some(Duration::from_secs(4105))
+    );
+    assert_eq!(parse_quota_reset_delay("no countdown here"), None);
+    // Repeated errors in scrollback: wait for the latest reset.
+    assert_eq!(
+        parse_quota_reset_delay("Resets in 5m\nResets in 1h"),
+        Some(Duration::from_secs(3600))
+    );
+}
+
+#[test]
+fn test_quota_reset_defers_continuation_and_reschedules_on_new_error() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path());
+    let mut engine = WatchdogEngine::initialize(paths.clone(), false).unwrap();
+    engine.config.quota_resume_padding_sec = 0;
+
+    let agent = AgentInfo {
+        pane: "5".into(),
+        agent: "antigravity".into(),
+        status: "idle".into(),
+        name: None,
+        cwd: None,
+    };
+    let old_text = "⚠ Individual quota reached. Resets in 0s.\nError ID: old";
+    let (client, state) = MockLuvusClient::new(vec![agent.clone()], vec![("5", old_text)]);
+
+    engine.process_agent_info(&client, &agent, false);
+    assert!(state.lock().unwrap().sent_texts.is_empty());
+    assert!(engine.deferred_resumes.contains_key("5"));
+
+    // Schedule survives an engine restart.
+    let restored = WatchdogEngine::initialize(paths, false).unwrap();
+    assert!(restored.deferred_resumes.contains_key("5"));
+
+    // A newer quota error while waiting postpones the continuation, with no send.
+    state.lock().unwrap().pane_texts.insert(
+        "5".to_string(),
+        "⚠ Individual quota reached. Resets in 10m.\nError ID: new".to_string(),
+    );
+    engine.deferred_resumes.get_mut("5").unwrap().due_at = Instant::now();
+    assert_eq!(engine.process_due_quota_resumes(&client, false), 0);
+    assert_eq!(engine.deferred_resumes["5"].parsed_delay_sec, 600);
+    assert!(state.lock().unwrap().sent_texts.is_empty());
+
+    // Once the (new) reset time elapses, exactly one "继续" is sent.
+    engine.deferred_resumes.get_mut("5").unwrap().due_at = Instant::now();
+    assert_eq!(engine.process_due_quota_resumes(&client, false), 1);
+    assert!(!engine.deferred_resumes.contains_key("5"));
+    assert_eq!(
+        state.lock().unwrap().sent_texts,
+        vec![("5".to_string(), "继续".to_string())]
+    );
+}
+
+#[test]
+fn test_windows_named_pipe_resolution_and_session_discovery_parser() {
+    use std::path::Path;
+
+    let explicit = windows_pipe_name_from_socket_path(Path::new(r"\\.\pipe\luvus-custom"));
+    assert_eq!(explicit, r"\\.\pipe\luvus-custom");
+
+    let hashed = windows_pipe_name_from_socket_path(Path::new(r"C:\Users\alice\.luvus\luvus.sock"));
+    assert!(hashed.starts_with(r"\\.\pipe\luvus-"));
+    assert_eq!(hashed.len(), r"\\.\pipe\luvus-".len() + 16);
+
+    let session_json = r#"{
+        "sessions": [
+            {
+                "name": "other",
+                "default": false,
+                "running": true,
+                "endpoint": { "transport": "windows_named_pipe", "address": "\\\\.\\pipe\\luvus-other" }
+            },
+            {
+                "name": "default",
+                "default": true,
+                "running": true,
+                "endpoint": { "transport": "windows_named_pipe", "address": "\\\\.\\pipe\\luvus-0123456789abcdef" }
+            }
+        ]
+    }"#;
+    assert_eq!(
+        parse_session_list_pipe_address(session_json).as_deref(),
+        Some(r"\\.\pipe\luvus-0123456789abcdef")
+    );
+}
+
+#[test]
+fn test_exited_agent_and_shell_panes_are_removed_and_hidden() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path());
+    let mut engine = WatchdogEngine::initialize(paths, false).unwrap();
+
+    // Active agent pane alongside plain shell panes
+    let (client1, _) = MockLuvusClient::new(
+        vec![
+            AgentInfo {
+                pane: "1".into(),
+                agent: "codex".into(),
+                status: "working".into(),
+                name: None,
+                cwd: None,
+            },
+            AgentInfo {
+                pane: "2".into(),
+                agent: "/bin/zsh".into(),
+                status: "idle".into(),
+                name: None,
+                cwd: None,
+            },
+            AgentInfo {
+                pane: "3".into(),
+                agent: "pwsh.exe".into(),
+                status: "idle".into(),
+                name: None,
+                cwd: None,
+            },
+        ],
+        vec![],
+    );
+    engine.scan_once(&client1, true).unwrap();
+    let panes: Vec<&str> = engine.panes.keys().map(String::as_str).collect();
+    assert_eq!(panes, vec!["1"]);
+
+    // Agent in pane 1 exits back to bash shell via incremental update -> pane 1 disappears.
+    engine.process_agent_info(
+        &client1,
+        &AgentInfo {
+            pane: "1".into(),
+            agent: "-bash".into(),
+            status: "idle".into(),
+            name: None,
+            cwd: None,
+        },
+        true,
+    );
+    assert!(engine.panes.is_empty());
+
+    // Bring pane 4 back, then verify missing pane on scan_once is pruned cleanly.
+    let (client2, _) = MockLuvusClient::new(
+        vec![AgentInfo {
+            pane: "4".into(),
+            agent: "claude".into(),
+            status: "idle".into(),
+            name: None,
+            cwd: None,
+        }],
+        vec![],
+    );
+    engine.scan_once(&client2, true).unwrap();
+    assert!(engine.panes.contains_key("4"));
+
+    let (empty_client, _) = MockLuvusClient::new(vec![], vec![]);
+    engine.scan_once(&empty_client, true).unwrap();
+    assert!(engine.panes.is_empty());
+
+    assert_eq!(
+        parse_luvus_event_line(
+            r#"{"event":"pane.closed","sequence":12,"data":{"pane":"4"}}"#
+        ),
+        Some(LuvusEvent::PaneClosed {
+            pane: "4".into(),
+            sequence: Some(12),
+        })
+    );
+    assert_eq!(
+        parse_luvus_event_line(
+            r#"{"event":"terminal.closed","sequence":13,"data":{"pane_id":"5"}}"#
+        ),
+        Some(LuvusEvent::PaneClosed {
+            pane: "5".into(),
+            sequence: Some(13),
+        })
+    );
+}
+
+#[test]
+fn test_luvus_installation_detection_and_command_preview() {
+    let preview = luvus_install_command_preview();
+    assert!(!preview.is_empty());
+
+    let missing = detect_luvus_installation("/nonexistent/path/to/luvus-missing-bin");
+    assert!(!missing.installed);
+    assert!(missing.resolved_path.is_none());
+    assert!(missing.version.is_none());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let fake_bin = tmp.path().join("luvus");
+        std::fs::write(&fake_bin, "#!/bin/sh\necho 'luvus 0.9.9-test'\n").unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+
+        let resolved = resolve_luvus_executable(fake_bin.to_str().unwrap());
+        assert_eq!(resolved.as_deref(), Some(fake_bin.as_path()));
+
+        let status = detect_luvus_installation(fake_bin.to_str().unwrap());
+        assert!(status.installed);
+        assert_eq!(status.version.as_deref(), Some("luvus 0.9.9-test"));
+        assert_eq!(
+            status.resolved_path.as_deref(),
+            Some(fake_bin.to_string_lossy().as_ref())
+        );
+    }
 }

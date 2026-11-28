@@ -134,6 +134,15 @@ pub struct WatchdogConfig {
     pub whitelisted_send_texts: Vec<String>,
     #[serde(default = "default_non_retryable_regexes")]
     pub non_retryable_regexes: Vec<String>,
+    /// After a quota-limit message with `Resets in ...`, queue one automatic continuation.
+    #[serde(default = "default_quota_resume_enabled")]
+    pub quota_resume_enabled: bool,
+    /// Extra safety margin added to the parsed reset delay, in seconds.
+    #[serde(default = "default_quota_resume_padding_sec")]
+    pub quota_resume_padding_sec: u64,
+    /// Never schedule further out than this, in seconds (default: 24h).
+    #[serde(default = "default_quota_resume_max_delay_sec")]
+    pub quota_resume_max_delay_sec: u64,
     #[serde(default)]
     pub max_continuous_default: u32,
     #[serde(default = "default_audit_retention_days")]
@@ -177,10 +186,21 @@ fn default_whitelisted_send_texts() -> Vec<String> {
 fn default_audit_retention_days() -> u32 {
     30
 }
+fn default_quota_resume_enabled() -> bool {
+    true
+}
+fn default_quota_resume_padding_sec() -> u64 {
+    60
+}
+fn default_quota_resume_max_delay_sec() -> u64 {
+    24 * 3600
+}
 
 pub fn default_non_retryable_regexes() -> Vec<String> {
     vec![
-        r"credit balance|insufficient credits|not enough credits|billing|payment required|usage limit|quota exceeded".to_string(),
+        // Keep "billing" specific: Claude's status line contains "API Usage Billing" even on
+        // ordinary 429s, and a bare "billing" would wrongly suppress every transient error.
+        r"credit balance|insufficient credits|not enough credits|billing (error|issue|problem|limit|hard limit|account|disabled|suspended|not enabled|required)|payment required|usage limit|quota (exceeded|reached)|individual quota reached".to_string(),
         r"invalid api key|incorrect api key|authentication failed|unauthorized|forbidden|\b401\b|\b403\b".to_string(),
         r"account.*disabled|suspended|plan does not include|please log in|login required|sign in required".to_string(),
     ]
@@ -205,6 +225,9 @@ impl Default for WatchdogConfig {
             whitelisted_keys: default_whitelisted_keys(),
             whitelisted_send_texts: default_whitelisted_send_texts(),
             non_retryable_regexes: default_non_retryable_regexes(),
+            quota_resume_enabled: default_quota_resume_enabled(),
+            quota_resume_padding_sec: default_quota_resume_padding_sec(),
+            quota_resume_max_delay_sec: default_quota_resume_max_delay_sec(),
             max_continuous_default: 0,
             audit_retention_days: default_audit_retention_days(),
             redact_audit_summary: false,
@@ -586,7 +609,7 @@ pub fn default_builtin_rules() -> Vec<Rule> {
                 any_regex: vec![
                     r"stream disconnected before completion|Transport error|Connection dropped|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up".to_string(),
                     r"network.*(error|unreachable|changed)|temporarily unavailable|service unavailable|overloaded|rate limit|too many requests".to_string(),
-                    r"Internal Server Error|Bad Gateway|Gateway Timeout|API Error.*(5\d\d|timeout|overload|reset|disconnect)|timed? out|timeout exceeded|request timed out|connection reset|connection closed|server_error|upstream connect error".to_string(),
+                    r"Internal Server Error|Bad Gateway|Gateway Timeout|API Error.*(429|5\d\d|timeout|overload|reset|disconnect)|Request rejected \(429\)|timed? out|timeout exceeded|request timed out|connection reset|connection closed|server_error|upstream connect error".to_string(),
                 ],
                 all_regex: vec![],
                 none_regex: vec![],

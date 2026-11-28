@@ -24,7 +24,10 @@ use crate::engine::{
     EngineSnapshot, EvaluationReport, FinalDecision, WatchdogEngine, evaluate_rules_stateless,
     spawn_engine_loop,
 };
-use crate::luvus::{DynamicLuvusClient, LuvusClient};
+use crate::luvus::{
+    DynamicLuvusClient, LuvusClient, LuvusInstallStatus, detect_luvus_installation,
+    install_luvus_cli, luvus_install_command_preview,
+};
 use crate::ui::i18n::{pretty_time_with_clock, tr};
 use crate::ui::text_input::{TextInput, bind_input_keys};
 
@@ -120,6 +123,8 @@ struct SettingsInputs {
     whitelisted_keys: Entity<TextInput>,
     whitelisted_send_texts: Entity<TextInput>,
     non_retryable_regexes: Entity<TextInput>,
+    quota_resume_padding_sec: Entity<TextInput>,
+    quota_resume_max_delay_sec: Entity<TextInput>,
     max_continuous_default: Entity<TextInput>,
     audit_retention_days: Entity<TextInput>,
 }
@@ -130,6 +135,7 @@ struct SettingsState {
     global_dry_run: bool,
     paused_all: bool,
     redact_audit_summary: bool,
+    quota_resume_enabled: bool,
     validation_errors: Vec<String>,
     inputs: SettingsInputs,
 }
@@ -157,6 +163,10 @@ pub struct WatchdogApp {
     prev_pane_indices: HashMap<String, usize>,
     next_move_seq: u64,
     pane_move_anims: HashMap<String, (u64, i32, Instant)>,
+    luvus_status: Option<LuvusInstallStatus>,
+    luvus_checking: bool,
+    luvus_installing: bool,
+    luvus_install_feedback: Option<(bool, String)>,
 }
 
 impl WatchdogApp {
@@ -287,9 +297,101 @@ impl WatchdogApp {
             prev_pane_indices: initial_pane_indices,
             next_move_seq: 0,
             pane_move_anims: HashMap::new(),
+            luvus_status: None,
+            luvus_checking: false,
+            luvus_installing: false,
+            luvus_install_feedback: None,
         };
         app.run_simulation_internal(cx);
+        app.trigger_luvus_check(cx);
         app
+    }
+
+    fn configured_luvus_bin_for_check(&self, cx: &App) -> String {
+        let input_bin = self.settings.inputs.luvus_bin.read(cx).text().trim().to_string();
+        if input_bin.is_empty() {
+            self.snapshot.config.luvus_bin.clone()
+        } else {
+            input_bin
+        }
+    }
+
+    fn trigger_luvus_check(&mut self, cx: &mut Context<Self>) {
+        if self.luvus_checking || self.luvus_installing {
+            return;
+        }
+        let bin = self.configured_luvus_bin_for_check(cx);
+        self.luvus_checking = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let status = smol::unblock(move || detect_luvus_installation(&bin)).await;
+            let _ = this.update(cx, |app, cx| {
+                app.luvus_checking = false;
+                app.luvus_status = Some(status);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn trigger_luvus_install(&mut self, cx: &mut Context<Self>) {
+        if self.luvus_installing {
+            return;
+        }
+        let lang = self.lang();
+        self.luvus_installing = true;
+        self.luvus_install_feedback = Some((
+            false,
+            tr(
+                lang,
+                "正在执行官方安装脚本，请稍候...",
+                "Running official installer script, please wait...",
+            )
+            .to_string(),
+        ));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let res = smol::unblock(install_luvus_cli).await;
+            let _ = this.update(cx, |app, cx| {
+                app.luvus_installing = false;
+                app.luvus_checking = false;
+                let lang = app.lang();
+                match res {
+                    Ok(status) => {
+                        let ver = status
+                            .version
+                            .as_deref()
+                            .unwrap_or("unknown");
+                        let path = status
+                            .resolved_path
+                            .as_deref()
+                            .unwrap_or("luvus");
+                        let msg = match lang {
+                            UiLanguage::Zh => format!("luvus 安装成功: {ver} ({path})"),
+                            UiLanguage::En => format!("luvus installed: {ver} ({path})"),
+                        };
+                        app.luvus_status = Some(status);
+                        app.luvus_install_feedback = Some((false, msg.clone()));
+                        app.set_banner(false, msg);
+                        let client = DynamicLuvusClient::from_config(&app.snapshot.config);
+                        let _ = app.engine.lock().unwrap().scan_once(&client, false);
+                        app.refresh_snapshot();
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        app.luvus_status = Some(detect_luvus_installation(
+                            &app.configured_luvus_bin_for_check(cx),
+                        ));
+                        app.luvus_install_feedback = Some((true, msg.clone()));
+                        app.set_banner(true, msg);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn lang(&self) -> UiLanguage {
@@ -415,6 +517,7 @@ impl WatchdogApp {
             global_dry_run: cfg.global_dry_run,
             paused_all: cfg.paused_all,
             redact_audit_summary: cfg.redact_audit_summary,
+            quota_resume_enabled: cfg.quota_resume_enabled,
             validation_errors: Vec::new(),
             inputs: SettingsInputs {
                 luvus_socket_path: cx.new(|cx| {
@@ -422,8 +525,8 @@ impl WatchdogApp {
                         cx,
                         tr(
                             lang,
-                            "留空则自动使用 $LUVUS_SOCKET_PATH 或 ~/.luvus/luvus.sock",
-                            "Leave empty to auto-use $LUVUS_SOCKET_PATH or ~/.luvus/luvus.sock",
+                            "留空则自动使用 $LUVUS_SOCKET_PATH、~/.luvus/luvus.sock 或 Windows Named Pipe",
+                            "Leave empty to auto-use $LUVUS_SOCKET_PATH, ~/.luvus/luvus.sock, or Windows Named Pipe",
                         ),
                         cfg.luvus_socket_path.clone(),
                         false,
@@ -470,6 +573,12 @@ impl WatchdogApp {
                     )
                     .with_monospace(true)
                     .with_line_limits(4, 8)
+                }),
+                quota_resume_padding_sec: cx.new(|cx| {
+                    TextInput::new(cx, "60", cfg.quota_resume_padding_sec.to_string(), false)
+                }),
+                quota_resume_max_delay_sec: cx.new(|cx| {
+                    TextInput::new(cx, "86400", cfg.quota_resume_max_delay_sec.to_string(), false)
                 }),
                 max_continuous_default: cx.new(|cx| {
                     TextInput::new(cx, "0", cfg.max_continuous_default.to_string(), false)
@@ -660,6 +769,7 @@ impl WatchdogApp {
         self.settings.global_dry_run = cfg.global_dry_run;
         self.settings.paused_all = cfg.paused_all;
         self.settings.redact_audit_summary = cfg.redact_audit_summary;
+        self.settings.quota_resume_enabled = cfg.quota_resume_enabled;
         let inp = &self.settings.inputs;
         inp.luvus_socket_path
             .update(cx, |i, cx| i.set_text(cfg.luvus_socket_path.clone(), cx));
@@ -688,6 +798,12 @@ impl WatchdogApp {
         });
         inp.non_retryable_regexes.update(cx, |i, cx| {
             i.set_text(cfg.non_retryable_regexes.join("\n"), cx)
+        });
+        inp.quota_resume_padding_sec.update(cx, |i, cx| {
+            i.set_text(cfg.quota_resume_padding_sec.to_string(), cx)
+        });
+        inp.quota_resume_max_delay_sec.update(cx, |i, cx| {
+            i.set_text(cfg.quota_resume_max_delay_sec.to_string(), cx)
         });
         inp.max_continuous_default.update(cx, |i, cx| {
             i.set_text(cfg.max_continuous_default.to_string(), cx)
@@ -1308,6 +1424,17 @@ impl WatchdogApp {
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty())
                 .collect(),
+            quota_resume_enabled: self.settings.quota_resume_enabled,
+            quota_resume_padding_sec: parse_u64(
+                inp.quota_resume_padding_sec.read(cx).text(),
+                "quotaResumePaddingSec",
+                &mut errs,
+            ),
+            quota_resume_max_delay_sec: parse_u64(
+                inp.quota_resume_max_delay_sec.read(cx).text(),
+                "quotaResumeMaxDelaySec",
+                &mut errs,
+            ),
             max_continuous_default: parse_u32(
                 inp.max_continuous_default.read(cx).text(),
                 "maxContinuousDefault",
@@ -1345,6 +1472,7 @@ impl WatchdogApp {
                         "Settings validated and saved atomically",
                     ),
                 );
+                self.trigger_luvus_check(cx);
             }
             Err(save_errs) => self.settings.validation_errors = save_errs,
         }
@@ -1564,6 +1692,9 @@ impl WatchdogApp {
                                 MouseButton::Left,
                                 cx.listener(move |app, _, _, cx| {
                                     app.active_tab = tab;
+                                    if tab == ActiveTab::Settings {
+                                        app.trigger_luvus_check(cx);
+                                    }
                                     cx.notify();
                                 }),
                             )
@@ -3198,6 +3329,7 @@ impl WatchdogApp {
                         })),
                 )
             })
+            .child(self.render_luvus_install_card(cx))
             .child(
                 div()
                     .flex()
@@ -3268,6 +3400,20 @@ impl WatchdogApp {
                         cx.listener(|app, _, _, cx| {
                             app.settings.redact_audit_summary =
                                 !app.settings.redact_audit_summary;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(toggle_chip(
+                        "set-quota-resume",
+                        if s.quota_resume_enabled {
+                            tr(lang, "额度重置后续跑: 开启", "Resume After Quota Reset: ON")
+                        } else {
+                            tr(lang, "额度重置后续跑: 关闭", "Resume After Quota Reset: OFF")
+                        },
+                        s.quota_resume_enabled,
+                        cx.listener(|app, _, _, cx| {
+                            app.settings.quota_resume_enabled =
+                                !app.settings.quota_resume_enabled;
                             cx.notify();
                         }),
                     )),
@@ -3401,6 +3547,181 @@ impl WatchdogApp {
                 ),
                 s.inputs.non_retryable_regexes.clone(),
             ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .child(labeled_field(
+                        tr(
+                            lang,
+                            "额度重置后额外等待秒数（安全缓冲）",
+                            "Extra seconds after quota reset (safety margin)",
+                        ),
+                        s.inputs.quota_resume_padding_sec.clone(),
+                    ))
+                    .child(labeled_field(
+                        tr(
+                            lang,
+                            "额度续跑最长等待秒数（0=不限）",
+                            "Max wait before quota resume in seconds (0 = unlimited)",
+                        ),
+                        s.inputs.quota_resume_max_delay_sec.clone(),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_luvus_install_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let lang = self.lang();
+        let installed = self.luvus_status.as_ref().is_some_and(|st| st.installed);
+
+        let (badge_text, badge_bg, badge_fg) = if self.luvus_installing {
+            (
+                tr(lang, "正在安装...", "Installing..."),
+                0x78350f,
+                0xfde68a,
+            )
+        } else if self.luvus_checking {
+            (
+                tr(lang, "检测中...", "Checking..."),
+                0x334155,
+                0xcbd5e1,
+            )
+        } else if installed {
+            (tr(lang, "已安装", "Installed"), 0x065f46, 0x6ee7b7)
+        } else {
+            (tr(lang, "未安装", "Not Installed"), 0x7f1d1d, 0xfca5a5)
+        };
+
+        let detail_text = if self.luvus_installing {
+            match lang {
+                UiLanguage::Zh => format!(
+                    "正在执行官方安装命令: {}",
+                    luvus_install_command_preview()
+                ),
+                UiLanguage::En => format!(
+                    "Running official installer: {}",
+                    luvus_install_command_preview()
+                ),
+            }
+        } else if let Some(st) = &self.luvus_status {
+            if st.installed {
+                let ver = st.version.as_deref().unwrap_or("luvus");
+                let path = st.resolved_path.as_deref().unwrap_or("luvus");
+                match lang {
+                    UiLanguage::Zh => format!("版本: {ver}  |  路径: {path}"),
+                    UiLanguage::En => format!("Version: {ver}  |  Path: {path}"),
+                }
+            } else if let Some(err) = &st.error {
+                match lang {
+                    UiLanguage::Zh => format!(
+                        "未能运行 luvus ({err})。官方安装命令: {}",
+                        luvus_install_command_preview()
+                    ),
+                    UiLanguage::En => format!(
+                        "Could not run luvus ({err}). Official install: {}",
+                        luvus_install_command_preview()
+                    ),
+                }
+            } else {
+                match lang {
+                    UiLanguage::Zh => format!(
+                        "未在 PATH 或常用目录检测到 luvus，可点击右侧“一键安装 luvus”（执行: {}）",
+                        luvus_install_command_preview()
+                    ),
+                    UiLanguage::En => format!(
+                        "luvus was not found on PATH or standard directories. Click \"Install luvus\" ({})",
+                        luvus_install_command_preview()
+                    ),
+                }
+            }
+        } else {
+            tr(
+                lang,
+                "等待检测 luvus CLI 安装状态...",
+                "Checking luvus CLI installation status...",
+            )
+            .to_string()
+        };
+
+        div()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x111827))
+            .border_1()
+            .border_color(if installed {
+                rgb(0x1e3a8a)
+            } else if self.luvus_installing || self.luvus_checking {
+                rgb(0x334155)
+            } else {
+                rgb(0x991b1b)
+            })
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xf8fafc))
+                                    .child(tr(lang, "luvus 运行环境检测", "luvus CLI Environment")),
+                            )
+                            .child(badge(badge_text, badge_bg, badge_fg)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(action_btn(
+                                "recheck-luvus-btn",
+                                tr(lang, "重新检测", "Re-check"),
+                                0x334155,
+                                cx.listener(|app, _, _, cx| app.trigger_luvus_check(cx)),
+                            ))
+                            .when(!installed, |d| {
+                                d.child(action_btn(
+                                    "install-luvus-btn",
+                                    if self.luvus_installing {
+                                        tr(lang, "正在安装...", "Installing...")
+                                    } else {
+                                        tr(lang, "一键安装 luvus", "Install luvus")
+                                    },
+                                    if self.luvus_installing { 0x475569 } else { 0x2563eb },
+                                    cx.listener(|app, _, _, cx| app.trigger_luvus_install(cx)),
+                                ))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child(detail_text),
+            )
+            .when_some(self.luvus_install_feedback.as_ref(), |d, (is_err, msg)| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(if *is_err { rgb(0xfca5a5) } else { rgb(0x6ee7b7) })
+                        .child(msg.clone()),
+                )
+            })
             .into_any_element()
     }
 }

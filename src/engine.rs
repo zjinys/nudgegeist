@@ -3,20 +3,21 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditRecord, AuditResult, AuditStore, SkipReason};
 use crate::config::{
     ActionType, AppPaths, DedupeStrategy, MatchRegion, MatchSource, ReviewStatus, Rule, RulesFile,
     TransportMode, UiLanguage, WatchdogConfig, compile_regex_cached, load_or_init_config,
-    resolve_luvus_socket_path, save_json_atomic, validate_config, validate_rules_file,
+    save_json_atomic, validate_config, validate_rules_file,
 };
 use crate::luvus::{
     AgentInfo, DynamicLuvusClient, LuvusClient, LuvusEvent, RealLuvusClient, UnixSocketUhpClient,
-    parse_luvus_event_line,
+    parse_luvus_event_line, resolve_uhp_endpoint,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,13 +116,151 @@ pub fn normalize_text(text: &str) -> String {
     text.replace('\u{00a0}', " ")
 }
 
-/// Extract Claude's latest turn after the last non-empty `❯` prompt line, matching bash watchdog.
+/// Parse compact reset countdowns such as `Resets in 1h8m25s`, `reset in 8m` or `Resets in 45s`.
+/// When a scrollback contains several quota errors, the longest delay is used so we wait for the
+/// latest reset rather than an earlier, already-passed one.
+pub fn parse_quota_reset_delay(text: &str) -> Option<Duration> {
+    let lower = text.to_ascii_lowercase();
+    let mut best = 0u64;
+    let mut found = false;
+    for phrase in ["resets in", "reset in"] {
+        let mut offset = 0usize;
+        while let Some(rel) = lower[offset..].find(phrase) {
+            let start = offset + rel + phrase.len();
+            let end = (start + 80).min(lower.len());
+            let slice = &lower[start..end];
+            let bytes = slice.as_bytes();
+            let mut secs = 0u64;
+            let mut got = false;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let num_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == num_start {
+                    break;
+                }
+                let Ok(num) = slice[num_start..i].parse::<u64>() else {
+                    break;
+                };
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+                let mult = match bytes[i] {
+                    b'd' => 86_400,
+                    b'h' => 3_600,
+                    b'm' => 60,
+                    b's' => 1,
+                    _ => break,
+                };
+                i += 1;
+                secs = secs.saturating_add(num.saturating_mul(mult));
+                got = true;
+            }
+            if got {
+                found = true;
+                best = best.max(secs);
+            }
+            offset = start;
+        }
+    }
+    found.then_some(Duration::from_secs(best))
+}
+
+/// Identify a specific quota event so a stale scrollback line does not postpone the resume
+/// forever, while a genuinely new quota error can be re-queued.
+fn quota_event_signature(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    for (idx, line) in lines.iter().enumerate().rev() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("quota reached") || lower.contains("quota exceeded") {
+            let mut sig = line.trim().to_string();
+            if let Some(next) = lines.get(idx + 1)
+                && next
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("error id:")
+            {
+                sig.push('|');
+                sig.push_str(next.trim());
+            }
+            return Some(sig);
+        }
+    }
+    None
+}
+
+fn is_quota_non_retryable(hit: &str) -> bool {
+    hit.to_ascii_lowercase().contains("quota")
+}
+
+fn clamp_quota_delay(cfg: &WatchdogConfig, secs: u64) -> u64 {
+    if cfg.quota_resume_max_delay_sec == 0 {
+        secs
+    } else {
+        secs.min(cfg.quota_resume_max_delay_sec)
+    }
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// One-shot continuation queued after a quota-limit message. Stored in `state.json` so it
+/// survives an engine restart.
+#[derive(Debug, Clone)]
+pub struct DeferredResume {
+    pub pane: String,
+    pub agent: String,
+    pub due_at: Instant,
+    pub due_epoch: u64,
+    pub parsed_delay_sec: u64,
+    pub padding_sec: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDeferredResume {
+    pane: String,
+    agent: String,
+    due_epoch: u64,
+    parsed_delay_sec: u64,
+    padding_sec: u64,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DeferredState {
+    #[serde(default)]
+    schedules: Vec<PersistedDeferredResume>,
+}
+
+/// Claude Code renders `❯ Resend your message to try again` as an input-box placeholder after
+/// a transient API error. It is not a real user prompt: treating it as one hides the error above
+/// it from the evaluated region, so the recover rule never fires.
+fn is_claude_placeholder_prompt(rest: &str) -> bool {
+    let t = rest.trim().to_ascii_lowercase();
+    t.starts_with("resend your message")
+}
+
+/// Extract Claude's latest turn after the last non-empty, non-placeholder `❯` prompt line.
 pub fn claude_turn_region(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut last_prompt_idx: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
         if let Some(rest) = line.strip_prefix('❯')
             && !rest.trim().is_empty()
+            && !is_claude_placeholder_prompt(rest)
         {
             last_prompt_idx = Some(idx);
         }
@@ -561,6 +700,8 @@ pub struct WatchdogEngine {
     dedupe_cache: HashMap<(String, String, String), Instant>,
     /// Delayed per-pane rechecks scheduled after cooldown skip or transient status/output race.
     pending_rechecks: HashMap<String, (AgentInfo, Instant, bool)>,
+    /// One-shot continuations queued until a reported quota reset time elapses.
+    pub deferred_resumes: HashMap<String, DeferredResume>,
     config_mtime: Option<SystemTime>,
     rules_mtime: Option<SystemTime>,
     pub events_connected: bool,
@@ -598,7 +739,7 @@ impl WatchdogEngine {
             .ok();
         let active_transport = DynamicLuvusClient::from_config(&config).transport_label();
 
-        Ok(Self {
+        let mut engine = Self {
             paths,
             config,
             rules_file,
@@ -610,6 +751,7 @@ impl WatchdogEngine {
             cooldowns: HashMap::new(),
             dedupe_cache: HashMap::new(),
             pending_rechecks: HashMap::new(),
+            deferred_resumes: HashMap::new(),
             config_mtime,
             rules_mtime,
             events_connected: false,
@@ -622,7 +764,62 @@ impl WatchdogEngine {
             total_errors: 0,
             action_seq: 0,
             state_version: 1,
-        })
+        };
+        engine.load_deferred_resumes();
+        Ok(engine)
+    }
+
+    fn load_deferred_resumes(&mut self) {
+        let Ok(raw) = fs::read_to_string(self.paths.state_file()) else {
+            return;
+        };
+        let Ok(state) = serde_json::from_str::<DeferredState>(&raw) else {
+            return;
+        };
+        let now = now_epoch();
+        for s in state.schedules {
+            let wait = s.due_epoch.saturating_sub(now);
+            self.deferred_resumes.insert(
+                s.pane.clone(),
+                DeferredResume {
+                    pane: s.pane,
+                    agent: s.agent,
+                    due_at: Instant::now() + Duration::from_secs(wait),
+                    due_epoch: s.due_epoch,
+                    parsed_delay_sec: s.parsed_delay_sec,
+                    padding_sec: s.padding_sec,
+                    signature: s.signature,
+                },
+            );
+        }
+    }
+
+    fn persist_deferred_resumes(&self) {
+        let schedules: Vec<PersistedDeferredResume> = self
+            .deferred_resumes
+            .values()
+            .map(|s| PersistedDeferredResume {
+                pane: s.pane.clone(),
+                agent: s.agent.clone(),
+                due_epoch: s.due_epoch,
+                parsed_delay_sec: s.parsed_delay_sec,
+                padding_sec: s.padding_sec,
+                signature: s.signature.clone(),
+            })
+            .collect();
+        let _ = save_json_atomic(
+            &self.paths.state_file(),
+            &DeferredState { schedules },
+        );
+    }
+
+    fn cancel_quota_resume(&mut self, pane: &str) -> bool {
+        if self.deferred_resumes.remove(pane).is_some() {
+            self.persist_deferred_resumes();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn clear_audit_logs(&mut self) -> Result<()> {
@@ -843,9 +1040,26 @@ impl WatchdogEngine {
             Ok(agents) => {
                 self.last_luvus_error = None;
                 self.last_scan_at = Some(Utc::now());
+                let active_panes: std::collections::HashSet<String> = agents
+                    .iter()
+                    .filter(|info| {
+                        !crate::luvus::is_non_agent_pane(&info.agent, &info.status)
+                            && scope_matches(&self.config.allowed_panes, &info.pane)
+                            && scope_matches(&self.config.allowed_agents, &info.agent)
+                    })
+                    .map(|info| info.pane.clone())
+                    .collect();
                 for info in agents {
                     self.process_agent_info(client, &info, cli_dry_run);
                 }
+                self.panes.retain(|pane, _| active_panes.contains(pane));
+                self.pending_rechecks
+                    .retain(|pane, _| active_panes.contains(pane));
+                self.dedupe_cache
+                    .retain(|(pane, _, _), _| active_panes.contains(pane));
+                self.deferred_resumes
+                    .retain(|pane, _| active_panes.contains(pane));
+                self.process_due_quota_resumes(client, cli_dry_run);
                 self.state_version = self.state_version.wrapping_add(1);
                 Ok(())
             }
@@ -856,6 +1070,17 @@ impl WatchdogEngine {
                 Err(err)
             }
         }
+    }
+
+    pub fn remove_pane(&mut self, pane: &str) -> bool {
+        let existed = self.panes.remove(pane).is_some();
+        self.pending_rechecks.remove(pane);
+        self.cancel_quota_resume(pane);
+        self.dedupe_cache.retain(|(p, _, _), _| p != pane);
+        if existed {
+            self.state_version = self.state_version.wrapping_add(1);
+        }
+        existed
     }
 
     pub fn process_agent_info(
@@ -898,6 +1123,218 @@ impl WatchdogEngine {
         count
     }
 
+    /// Queue one continuation for a quota reset reported by the pane (`Resets in 1h8m25s`).
+    fn schedule_quota_resume(
+        &mut self,
+        info: &AgentInfo,
+        parsed: Duration,
+        signature: String,
+        redact: bool,
+    ) {
+        if !self.config.quota_resume_enabled {
+            return;
+        }
+        let parsed_sec = parsed.as_secs();
+        let delay = clamp_quota_delay(&self.config, parsed_sec);
+        let padding = self.config.quota_resume_padding_sec;
+        let total = delay.saturating_add(padding).max(1);
+        let due_epoch = now_epoch().saturating_add(total);
+        if let Some(existing) = self.deferred_resumes.get(&info.pane)
+            && existing.due_epoch >= due_epoch
+        {
+            return;
+        }
+        self.deferred_resumes.insert(
+            info.pane.clone(),
+            DeferredResume {
+                pane: info.pane.clone(),
+                agent: info.agent.clone(),
+                due_at: Instant::now() + Duration::from_secs(total),
+                due_epoch,
+                parsed_delay_sec: parsed_sec,
+                padding_sec: padding,
+                signature,
+            },
+        );
+        self.persist_deferred_resumes();
+        let rec = AuditRecord::new(
+            &info.pane,
+            &info.agent,
+            &info.status,
+            Some("quota-resume".to_string()),
+            Some("配额重置后自动续跑".to_string()),
+            format!("额度重置约 {delay}s 后自动续跑"),
+            None,
+            "send: \"继续\"",
+            AuditResult::Skipped,
+            Some(SkipReason::Retrying),
+            false,
+            format!("已排队：等待额度重置约 {delay}s + {padding}s 安全缓冲后发送一次继续"),
+        );
+        self.append_audit_and_bump(rec, redact);
+    }
+
+    /// Fire due quota-resume schedules. Re-reads the pane first so a newer quota error
+    /// re-queues itself instead of sending into an still-exhausted quota.
+    pub fn process_due_quota_resumes(
+        &mut self,
+        client: &dyn LuvusClient,
+        cli_dry_run: bool,
+    ) -> usize {
+        if !self.config.quota_resume_enabled {
+            return 0;
+        }
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .deferred_resumes
+            .iter()
+            .filter_map(|(pane, s)| (s.due_at <= now).then_some(pane.clone()))
+            .collect();
+        let mut count = 0;
+        let redact = self.config.redact_audit_summary;
+
+        for pane in due {
+            let Some(sched) = self.deferred_resumes.remove(&pane) else {
+                continue;
+            };
+            self.persist_deferred_resumes();
+            if self.config.paused_all
+                || !scope_matches(&self.config.allowed_panes, &pane)
+                || !scope_matches(&self.config.allowed_agents, &sched.agent)
+            {
+                continue;
+            }
+            let Some(st) = self.panes.get(&pane) else {
+                continue;
+            };
+            let status = st.status.clone();
+            if st.manual_paused || st.continuous_paused || status.eq_ignore_ascii_case("working") {
+                continue;
+            }
+
+            let send_text = "继续";
+            if !self
+                .config
+                .whitelisted_send_texts
+                .iter()
+                .any(|w| w == send_text)
+            {
+                continue;
+            }
+
+            let raw_text =
+                match client.read_pane(&pane, self.config.read_lines_error, MatchSource::Visible) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        self.total_errors += 1;
+                        self.last_luvus_error = Some(err.to_string());
+                        continue;
+                    }
+                };
+
+            // Same quota event (stale line in scrollback) -> safe to resume. A different
+            // Error ID means a new quota error arrived; wait for its own reset instead.
+            let current_sig = quota_event_signature(&raw_text).unwrap_or_default();
+            if !current_sig.is_empty() && current_sig != sched.signature {
+                let parsed = parse_quota_reset_delay(&raw_text)
+                    .unwrap_or(Duration::from_secs(sched.parsed_delay_sec));
+                let delay = clamp_quota_delay(&self.config, parsed.as_secs());
+                let total = delay.saturating_add(sched.padding_sec).max(1);
+                let due_epoch = now_epoch().saturating_add(total);
+                self.deferred_resumes.insert(
+                    pane.clone(),
+                    DeferredResume {
+                        pane: pane.clone(),
+                        agent: sched.agent.clone(),
+                        due_at: Instant::now() + Duration::from_secs(total),
+                        due_epoch,
+                        parsed_delay_sec: parsed.as_secs(),
+                        padding_sec: sched.padding_sec,
+                        signature: current_sig.clone(),
+                    },
+                );
+                self.persist_deferred_resumes();
+                let rec = AuditRecord::new(
+                    &pane,
+                    &sched.agent,
+                    &status,
+                    Some("quota-resume".to_string()),
+                    Some("配额重置后自动续跑".to_string()),
+                    format!("额度重置约 {delay}s 后自动续跑"),
+                    None,
+                    "send: \"继续\"",
+                    AuditResult::Skipped,
+                    Some(SkipReason::Retrying),
+                    false,
+                    format!("等待期间出现新的额度错误，已顺延 {total}s 后重试"),
+                );
+                self.append_audit_and_bump(rec, redact);
+                continue;
+            }
+
+            count += 1;
+            let effective_dry_run = cli_dry_run || self.config.global_dry_run;
+            let (result, detail) = if effective_dry_run {
+                self.total_dry_runs += 1;
+                (
+                    AuditResult::DryRun,
+                    "Dry-Run 模式：仅记录计划动作，未调用 luvus".to_string(),
+                )
+            } else {
+                match client.send_text(&pane, send_text) {
+                    Ok(()) => (
+                        AuditResult::Success,
+                        format!(
+                            "额度重置后自动发送一次继续（等待 {}s + {}s 缓冲）",
+                            sched.parsed_delay_sec, sched.padding_sec
+                        ),
+                    ),
+                    Err(err) => {
+                        self.total_errors += 1;
+                        self.last_luvus_error = Some(err.to_string());
+                        (AuditResult::Failure, format!("执行失败: {err}"))
+                    }
+                }
+            };
+            if matches!(result, AuditResult::Success | AuditResult::DryRun) {
+                self.action_seq += 1;
+                *self
+                    .rule_hit_counts
+                    .entry("quota-resume".to_string())
+                    .or_insert(0) += 1;
+                self.rule_last_hit
+                    .insert("quota-resume".to_string(), Utc::now());
+                if let Some(state) = self.panes.get_mut(&pane) {
+                    state.continuous_count += 1;
+                    state.last_action = Some(format!(
+                        "{}send: \"继续\"",
+                        if effective_dry_run { "[dry-run] " } else { "" }
+                    ));
+                    state.last_action_at = Some(Utc::now());
+                    state.action_seq += 1;
+                    state.non_retryable_notified = false;
+                }
+            }
+            let rec = AuditRecord::new(
+                &pane,
+                &sched.agent,
+                &status,
+                Some("quota-resume".to_string()),
+                Some("配额重置后自动续跑".to_string()),
+                format!("额度重置约 {}s", sched.parsed_delay_sec),
+                None,
+                "send: \"继续\"",
+                result,
+                None,
+                effective_dry_run,
+                detail,
+            );
+            self.append_audit_and_bump(rec, redact);
+            self.state_version = self.state_version.wrapping_add(1);
+        }
+        count
+    }
+
     fn process_agent_info_inner(
         &mut self,
         client: &dyn LuvusClient,
@@ -905,9 +1342,15 @@ impl WatchdogEngine {
         cli_dry_run: bool,
         allow_nomatch_retry: bool,
     ) {
+        if crate::luvus::is_non_agent_pane(&info.agent, &info.status) {
+            self.remove_pane(&info.pane);
+            return;
+        }
+
         if !scope_matches(&self.config.allowed_panes, &info.pane)
             || !scope_matches(&self.config.allowed_agents, &info.agent)
         {
+            self.remove_pane(&info.pane);
             return;
         }
 
@@ -953,6 +1396,7 @@ impl WatchdogEngine {
                 self.dedupe_cache.retain(|(p, _, _), _| p != &pane_id);
             }
             self.pending_rechecks.remove(&info.pane);
+            self.cancel_quota_resume(&info.pane);
             if is_new_pane || status_changed || reset_occurred {
                 self.state_version = self.state_version.wrapping_add(1);
             }
@@ -1039,6 +1483,14 @@ impl WatchdogEngine {
                             detail.clone(),
                         );
                         self.append_audit_and_bump(rec, redact);
+                    }
+                    if let Some(hit) = report.non_retryable_hit.as_deref()
+                        && is_quota_non_retryable(hit)
+                        && let Some(delay) = parse_quota_reset_delay(&raw_text)
+                    {
+                        let signature = quota_event_signature(&raw_text)
+                            .unwrap_or_else(|| delay.as_secs().to_string());
+                        self.schedule_quota_resume(info, delay, signature, redact);
                     }
                 }
                 FinalDecision::Skipped(reason, detail) => {
@@ -1337,35 +1789,42 @@ pub fn spawn_engine_loop(
         let mut last_sequence: Option<u64> = None;
 
         while !stop.load(Ordering::Relaxed) {
-            let (cfg_snapshot, reconnect_delay, use_socket, sock_path) = {
+            let (cfg_snapshot, reconnect_delay, use_socket, sock_path, transport_label) = {
                 let mut eng = shared.lock().unwrap();
                 let client = DynamicLuvusClient::from_config(&eng.config);
-                eng.active_transport = client.transport_label();
+                let label = client.transport_label();
+                eng.active_transport = label.clone();
                 let _ = eng.scan_once(&client, cli_dry_run);
-                let sock_path = resolve_luvus_socket_path(&eng.config);
-                let use_socket = cfg!(unix)
-                    && match eng.config.transport_mode {
-                        TransportMode::Socket => true,
-                        TransportMode::Cli => false,
-                        TransportMode::Auto => sock_path.exists(),
-                    };
+                let (sock_path, available) = resolve_uhp_endpoint(&eng.config);
+                let use_socket = match eng.config.transport_mode {
+                    TransportMode::Socket => true,
+                    TransportMode::Cli => false,
+                    TransportMode::Auto => available,
+                };
                 (
                     eng.config.clone(),
                     eng.config.reconnect_delay_sec.max(1),
                     use_socket,
                     sock_path,
+                    label,
                 )
             };
 
-            #[cfg(not(unix))]
-            let _ = (use_socket, &sock_path);
-
-            #[cfg(unix)]
             if use_socket {
                 let sock_client = UnixSocketUhpClient::new(&sock_path);
                 match sock_client.subscribe_events(last_sequence) {
                     Ok(mut reader) => {
-                        let label = format!("UHP Socket ({})", sock_path.display());
+                        let label = if cfg!(windows)
+                            || sock_path
+                                .to_string_lossy()
+                                .to_ascii_lowercase()
+                                .starts_with(r"\\.\pipe\")
+                        {
+                            format!("UHP Named Pipe ({})", sock_path.display())
+                        } else {
+                            format!("UHP Socket ({})", sock_path.display())
+                        };
+                        let _ = transport_label;
                         {
                             let mut eng = shared.lock().unwrap();
                             eng.events_connected = true;
@@ -1379,21 +1838,24 @@ pub fn spawn_engine_loop(
                         let mut last_maintenance = Instant::now();
                         let mut last_reload = Instant::now();
                         let mut fast_timeout = false;
-                        let _ = reader
+                        reader
                             .get_ref()
                             .set_read_timeout(Some(Duration::from_millis(1000)));
                         let mut line = String::new();
                         while !stop.load(Ordering::Relaxed) {
-                            line.clear();
                             let read_res = reader.read_line(&mut line);
                             let force_maint = match read_res {
                                 Ok(0) => break, // EOF -> reconnect
-                                Ok(_) => handle_event_stream_line(
-                                    &shared,
-                                    &line,
-                                    &mut last_sequence,
-                                    cli_dry_run,
-                                ),
+                                Ok(_) => {
+                                    let handled = handle_event_stream_line(
+                                        &shared,
+                                        &line,
+                                        &mut last_sequence,
+                                        cli_dry_run,
+                                    );
+                                    line.clear();
+                                    handled
+                                }
                                 Err(e)
                                     if e.kind() == std::io::ErrorKind::WouldBlock
                                         || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -1424,7 +1886,7 @@ pub fn spawn_engine_loop(
                                 if want_fast != fast_timeout {
                                     fast_timeout = want_fast;
                                     let ms = if fast_timeout { 200 } else { 1000 };
-                                    let _ = reader
+                                    reader
                                         .get_ref()
                                         .set_read_timeout(Some(Duration::from_millis(ms)));
                                 }
@@ -1559,17 +2021,16 @@ fn run_event_loop_tick(
         *last_reload = Instant::now();
         eng.hot_reload_if_changed();
     }
-    let cur_sock = resolve_luvus_socket_path(&eng.config);
+    let (cur_sock, cur_avail) = resolve_uhp_endpoint(&eng.config);
 
     let transport_changed = if let Some(sock_path) = connected_socket {
         eng.config.transport_mode == TransportMode::Cli || cur_sock != sock_path
     } else if let Some(bin) = connected_cli_bin {
-        let switch_to_sock = cfg!(unix)
-            && match eng.config.transport_mode {
-                TransportMode::Socket => true,
-                TransportMode::Auto => cur_sock.exists(),
-                TransportMode::Cli => false,
-            };
+        let switch_to_sock = match eng.config.transport_mode {
+            TransportMode::Socket => true,
+            TransportMode::Auto => cur_avail,
+            TransportMode::Cli => false,
+        };
         switch_to_sock || eng.config.luvus_bin != bin
     } else {
         false
@@ -1579,6 +2040,7 @@ fn run_event_loop_tick(
     }
 
     let need_client = !eng.pending_rechecks.is_empty()
+        || !eng.deferred_resumes.is_empty()
         || (eng.config.scan_interval_sec > 0 && last_poll.elapsed().as_secs() >= eng.config.scan_interval_sec);
     if need_client {
         let c = DynamicLuvusClient::from_config(&eng.config);
@@ -1588,6 +2050,7 @@ fn run_event_loop_tick(
             eng.state_version = eng.state_version.wrapping_add(1);
         }
         eng.process_due_rechecks(&c, cli_dry_run);
+        eng.process_due_quota_resumes(&c, cli_dry_run);
 
         let scan_interval = eng.config.scan_interval_sec;
         if scan_interval > 0 && last_poll.elapsed().as_secs() >= scan_interval {
@@ -1595,7 +2058,10 @@ fn run_event_loop_tick(
             *last_poll = Instant::now();
         }
     }
-    (false, !eng.pending_rechecks.is_empty())
+    (
+        false,
+        !eng.pending_rechecks.is_empty() || !eng.deferred_resumes.is_empty(),
+    )
 }
 
 /// Returns `true` when an actionable agent/resync event was processed.
@@ -1635,6 +2101,13 @@ fn handle_event_stream_line(
             };
             eng.process_agent_info(&c, &info, cli_dry_run);
             true
+        }
+        LuvusEvent::PaneClosed { pane, sequence } => {
+            if let Some(seq) = sequence {
+                *last_sequence = Some(seq);
+            }
+            let mut eng = shared.lock().unwrap();
+            eng.remove_pane(&pane)
         }
         LuvusEvent::ResyncRequired { sequence } => {
             let _ = sequence;
