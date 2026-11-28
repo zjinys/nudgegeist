@@ -655,7 +655,7 @@ impl Element for TextElement {
                 .shape_line(placeholder, font_size, &[run], None);
             let cursor = Some(fill(
                 Bounds::new(bounds.origin, size(px(2.), lh)),
-                gpui::rgb(0x60a5fa),
+                crate::ui::theme::themed(0x60a5fa),
             ));
             return PrepaintState {
                 lines: vec![LineRange {
@@ -769,7 +769,7 @@ impl Element for TextElement {
                 let x = bounds.left() + shaped.x_for_index(c_local);
                 cursor = Some(fill(
                     Bounds::new(point(x, y_top), size(px(2.), lh)),
-                    gpui::rgb(0x60a5fa),
+                    crate::ui::theme::themed(0x60a5fa),
                 ));
             }
 
@@ -841,9 +841,9 @@ impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
         let border_col = if focused {
-            gpui::rgb(0x3b82f6)
+            crate::ui::theme::themed(0x3b82f6)
         } else {
-            gpui::rgb(0x334155)
+            crate::ui::theme::themed(0x334155)
         };
 
         let mut container = div()
@@ -871,7 +871,7 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(gpui::rgb(0x0f172a))
+            .bg(crate::ui::theme::themed(0x0f172a))
             .border_1()
             .border_color(border_col)
             .rounded_md()
@@ -879,7 +879,7 @@ impl Render for TextInput {
             .py_1()
             .text_sm()
             .line_height(px(20.))
-            .text_color(gpui::rgb(0xe2e8f0));
+            .text_color(crate::ui::theme::themed(0xe2e8f0));
 
         if self.monospace {
             container = container.font_family("monospace");

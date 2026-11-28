@@ -9,7 +9,7 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Application, Bounds, ClipboardItem, Context,
     CursorStyle, Decorations, Entity, MouseButton, ResizeEdge, SharedString, TitlebarOptions,
     Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions, div,
-    ease_out_quint, point, prelude::*, px, rgb, size,
+    ease_out_quint, point, prelude::*, px, size,
 };
 
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/nudgegeist.png");
@@ -17,8 +17,8 @@ pub const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/nudgegeist.png");
 use crate::audit::{AuditRecord, AuditResult};
 use crate::config::{
     ActionType, AppPaths, DedupeStrategy, MatchRegion, MatchSource, ReviewStatus, Rule,
-    RuleAction, RuleDedupe, RuleGuards, RuleMatch, TransportMode, UiLanguage, WatchdogConfig,
-    import_rules_json, new_rule_template, split_csv, validate_config, validate_rule,
+    RuleAction, RuleDedupe, RuleGuards, RuleMatch, ThemeMode, TransportMode, UiLanguage,
+    WatchdogConfig, import_rules_json, new_rule_template, split_csv, validate_config, validate_rule,
 };
 use crate::engine::{
     EngineSnapshot, EvaluationReport, FinalDecision, WatchdogEngine, evaluate_rules_stateless,
@@ -30,6 +30,7 @@ use crate::luvus::{
 };
 use crate::ui::i18n::{pretty_time_with_clock, tr};
 use crate::ui::text_input::{TextInput, bind_input_keys};
+use crate::ui::theme::{set_mode as set_theme_mode, sync_system_appearance, themed, themed_pair};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
@@ -131,6 +132,7 @@ struct SettingsInputs {
 
 struct SettingsState {
     language: UiLanguage,
+    theme: ThemeMode,
     transport_mode: TransportMode,
     global_dry_run: bool,
     paused_all: bool,
@@ -235,6 +237,7 @@ impl WatchdogApp {
             loop {
                 smol::Timer::after(Duration::from_millis(800)).await;
                 let res = this.update(cx, |app, cx| {
+                    sync_system_appearance(cx);
                     let current_ver = app.engine.lock().unwrap().state_version;
                     if current_ver != app.last_state_version {
                         app.refresh_snapshot();
@@ -513,6 +516,7 @@ impl WatchdogApp {
         let lang = cfg.language;
         SettingsState {
             language: cfg.language,
+            theme: cfg.theme,
             transport_mode: cfg.transport_mode,
             global_dry_run: cfg.global_dry_run,
             paused_all: cfg.paused_all,
@@ -765,6 +769,8 @@ impl WatchdogApp {
 
     fn sync_settings_from_config(&mut self, cfg: &WatchdogConfig, cx: &mut Context<Self>) {
         self.settings.language = cfg.language;
+        self.settings.theme = cfg.theme;
+        set_theme_mode(cx, cfg.theme);
         self.settings.transport_mode = cfg.transport_mode;
         self.settings.global_dry_run = cfg.global_dry_run;
         self.settings.paused_all = cfg.paused_all;
@@ -1384,9 +1390,11 @@ impl WatchdogApp {
             })
         };
 
+        let selected_theme = self.settings.theme;
         let cfg = WatchdogConfig {
             version: self.snapshot.config.version,
             language: self.settings.language,
+            theme: self.settings.theme,
             transport_mode: self.settings.transport_mode,
             luvus_socket_path: inp.luvus_socket_path.read(cx).text().trim().to_string(),
             luvus_bin: inp.luvus_bin.read(cx).text().trim().to_string(),
@@ -1462,6 +1470,7 @@ impl WatchdogApp {
             Ok(()) => {
                 self.settings.validation_errors.clear();
                 self.refresh_snapshot();
+                set_theme_mode(cx, selected_theme);
                 let next_lang = self.lang();
                 window.set_window_title(tr(next_lang, "辣椒", "Nudgegeist"));
                 self.set_banner(
@@ -1496,10 +1505,10 @@ impl WatchdogApp {
                 div()
                     .text_base()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(0xf8fafc))
+                    .text_color(themed(0xf8fafc))
                     .child(tr(lang, "辣椒", "Nudgegeist Watchdog")),
             )
-            .child(div().w(px(1.)).h_4().bg(rgb(0x334155)));
+            .child(div().w(px(1.)).h_4().bg(themed(0x334155)));
 
         if cfg!(target_os = "macos") {
             brand = brand.pl(px(72.));
@@ -1567,9 +1576,9 @@ impl WatchdogApp {
             .justify_between()
             .gap_3()
             .px_4()
-            .bg(rgb(0x0b1220))
+            .bg(themed(0x0b1220))
             .border_b_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(themed(0x1e293b))
             .child(drag_area)
             .child(
                 div()
@@ -1621,7 +1630,7 @@ impl WatchdogApp {
                         cx.listener(|app, _, _, cx| app.on_reload_config(cx)),
                     ))
                     .when(show_window_controls, |d| {
-                        d.child(div().w(px(1.)).h_4().mx_1().bg(rgb(0x334155)))
+                        d.child(div().w(px(1.)).h_4().mx_1().bg(themed(0x334155)))
                             .child(win_control_btn("win-min-btn", "−", false, |_, window, _| {
                                 window.minimize_window();
                             }))
@@ -1652,9 +1661,9 @@ impl WatchdogApp {
             .flex()
             .flex_col()
             .justify_between()
-            .bg(rgb(0x0d1526))
+            .bg(themed(0x0d1526))
             .border_r_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(themed(0x1e293b))
             .p_3()
             .child(
                 div()
@@ -1671,20 +1680,20 @@ impl WatchdogApp {
                             .cursor_pointer()
                             .text_sm()
                             .bg(if active {
-                                rgb(0x1d4ed8)
+                                themed(0x1d4ed8)
                             } else {
-                                rgb(0x0d1526)
+                                themed(0x0d1526)
                             })
                             .text_color(if active {
-                                rgb(0xffffff)
+                                themed(0xffffff)
                             } else {
-                                rgb(0x94a3b8)
+                                themed(0x94a3b8)
                             })
                             .hover(|s| {
                                 if active {
                                     s
                                 } else {
-                                    s.bg(rgb(0x1e293b)).text_color(rgb(0xe2e8f0))
+                                    s.bg(themed(0x1e293b)).text_color(themed(0xe2e8f0))
                                 }
                             })
                             .child(label)
@@ -1707,20 +1716,20 @@ impl WatchdogApp {
                     .gap_1()
                     .pt_3()
                     .border_t_1()
-                    .border_color(rgb(0x1e293b))
+                    .border_color(themed(0x1e293b))
                     .text_xs()
-                    .text_color(rgb(0x64748b))
+                    .text_color(themed(0x64748b))
                     .child(tr(lang, "配置目录:", "Config Dir:"))
                     .child(
                         div()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(themed(0x94a3b8))
                             .truncate()
                             .child(paths.config_dir.display().to_string()),
                     )
                     .child(tr(lang, "缓存/审计目录:", "Cache / Audit Dir:"))
                     .child(
                         div()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(themed(0x94a3b8))
                             .truncate()
                             .child(paths.cache_dir.display().to_string()),
                     ),
@@ -1804,7 +1813,7 @@ impl WatchdogApp {
                                 div()
                                     .p_3()
                                     .text_sm()
-                                    .text_color(rgb(0x94a3b8))
+                                    .text_color(themed(0x94a3b8))
                                     .child(tr(
                                         lang,
                                         "当前未检测到活动 agent pane（可点击顶部“立即扫描”，或先启动 luvus 会话；也可直接进入“规则测试”页进行离线模拟）。",
@@ -1832,9 +1841,9 @@ impl WatchdogApp {
                                         .justify_between()
                                         .p_2()
                                         .rounded_md()
-                                        .bg(rgb(0x0f172a))
+                                        .bg(themed(0x0f172a))
                                         .border_1()
-                                        .border_color(rgb(0x1e293b))
+                                        .border_color(themed(0x1e293b))
                                         .child(
                                             div()
                                                 .flex()
@@ -1845,7 +1854,7 @@ impl WatchdogApp {
                                                     div()
                                                         .text_sm()
                                                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                        .text_color(rgb(0xf8fafc))
+                                                        .text_color(themed(0xf8fafc))
                                                         .child(format!(
                                                             "{} ({})",
                                                             p.pane, p.agent
@@ -1862,7 +1871,7 @@ impl WatchdogApp {
                                                 .child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(0x94a3b8))
+                                                        .text_color(themed(0x94a3b8))
                                                         .child({
                                                             let now = chrono::Utc::now();
                                                             let action_time = p
@@ -1973,8 +1982,8 @@ impl WatchdogApp {
                                                     let dy = start_y * (1.0 - eased_move);
                                                     let card = card.left(px(dx)).top(px(dy));
                                                     if delta < 0.98 {
-                                                        card.border_color(rgb(0xfacc15))
-                                                            .bg(rgb(0x172554))
+                                                        card.border_color(themed(0xfacc15))
+                                                            .bg(themed(0x172554))
                                                     } else {
                                                         card
                                                     }
@@ -1997,8 +2006,8 @@ impl WatchdogApp {
                                                         * decay;
                                                     let card = card.left(px(dx));
                                                     if delta < 0.98 {
-                                                        card.border_color(rgb(0xfacc15))
-                                                            .bg(rgb(0x172554))
+                                                        card.border_color(themed(0xfacc15))
+                                                            .bg(themed(0x172554))
                                                     } else {
                                                         card
                                                     }
@@ -2034,9 +2043,9 @@ impl WatchdogApp {
                     .min_h_0()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x0b1220))
+                    .bg(themed(0x0b1220))
                     .border_1()
-                    .border_color(rgb(0x1e293b))
+                    .border_color(themed(0x1e293b))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -2046,7 +2055,7 @@ impl WatchdogApp {
                             .flex_shrink_0()
                             .text_sm()
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(0xf1f5f9))
+                            .text_color(themed(0xf1f5f9))
                             .child(tr(lang, "最近审计动态", "Recent Audit Activity")),
                     )
                     .child(
@@ -2063,7 +2072,7 @@ impl WatchdogApp {
                                     div()
                                         .p_2()
                                         .text_sm()
-                                        .text_color(rgb(0x94a3b8))
+                                        .text_color(themed(0x94a3b8))
                                         .child(tr(lang, "暂无审计记录", "No audit records yet"))
                                         .into_any_element(),
                                 ]
@@ -2096,13 +2105,13 @@ impl WatchdogApp {
                     .flex()
                     .flex_col()
                     .border_r_1()
-                    .border_color(rgb(0x1e293b))
-                    .bg(rgb(0x0b1220))
+                    .border_color(themed(0x1e293b))
+                    .bg(themed(0x0b1220))
                     .child(
                         div()
                             .p_3()
                             .border_b_1()
-                            .border_color(rgb(0x1e293b))
+                            .border_color(themed(0x1e293b))
                             .flex()
                             .flex_row()
                             .flex_wrap()
@@ -2138,15 +2147,15 @@ impl WatchdogApp {
                             div()
                                 .p_3()
                                 .border_b_1()
-                                .border_color(rgb(0x334155))
-                                .bg(rgb(0x111c33))
+                                .border_color(themed(0x334155))
+                                .bg(themed(0x111c33))
                                 .flex()
                                 .flex_col()
                                 .gap_2()
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(0xfcd34d))
+                                        .text_color(themed(0xfcd34d))
                                         .child(tr(
                                             lang,
                                             "安全导入：外部规则将校验白名单与正则，默认进入禁用/仅Dry-Run待审核状态",
@@ -2158,7 +2167,7 @@ impl WatchdogApp {
                                     err_box.child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0xfca5a5))
+                                            .text_color(themed(0xfca5a5))
                                             .child(self.import_errors.join(" | ")),
                                     )
                                 })
@@ -2219,15 +2228,15 @@ impl WatchdogApp {
                                     .rounded_md()
                                     .cursor_pointer()
                                     .bg(if selected {
-                                        rgb(0x172554)
+                                        themed(0x172554)
                                     } else {
-                                        rgb(0x0f172a)
+                                        themed(0x0f172a)
                                     })
                                     .border_1()
                                     .border_color(if selected {
-                                        rgb(0x3b82f6)
+                                        themed(0x3b82f6)
                                     } else {
-                                        rgb(0x1e293b)
+                                        themed(0x1e293b)
                                     })
                                     .on_mouse_up(
                                         MouseButton::Left,
@@ -2248,7 +2257,7 @@ impl WatchdogApp {
                                                 div()
                                                     .text_sm()
                                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(0xf8fafc))
+                                                    .text_color(themed(0xf8fafc))
                                                     .truncate()
                                                     .child(rule.name.clone()),
                                             )
@@ -2294,7 +2303,7 @@ impl WatchdogApp {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0x94a3b8))
+                                                    .text_color(themed(0x94a3b8))
                                                     .child(match lang {
                                                         UiLanguage::Zh => format!(
                                                             "{} | 命中 {} 次",
@@ -2414,7 +2423,7 @@ impl WatchdogApp {
                                 div()
                                     .text_base()
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(0xf8fafc))
+                                    .text_color(themed(0xf8fafc))
                                     .child(tr(lang, "规则编辑器", "Rule Editor")),
                             )
                             .child(action_btn(
@@ -2456,16 +2465,16 @@ impl WatchdogApp {
                     div()
                         .p_3()
                         .rounded_md()
-                        .bg(rgb(0x450a0a))
+                        .bg(themed(0x450a0a))
                         .border_1()
-                        .border_color(rgb(0xef4444))
+                        .border_color(themed(0xef4444))
                         .flex()
                         .flex_col()
                         .gap_1()
                         .children(ed.validation_errors.iter().map(|e| {
                             div()
                                 .text_xs()
-                                .text_color(rgb(0xfca5a5))
+                                .text_color(themed(0xfca5a5))
                                 .child(format!("• {e}"))
                         })),
                 )
@@ -2654,9 +2663,9 @@ impl WatchdogApp {
                         div()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(0x0b1220))
+                            .bg(themed(0x0b1220))
                             .border_1()
-                            .border_color(rgb(0x1e293b))
+                            .border_color(themed(0x1e293b))
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -2837,7 +2846,7 @@ impl WatchdogApp {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(themed(0x94a3b8))
                             .child(tr(
                                 lang,
                                 "高级 JSON 编辑模式（保存时同样执行 schema、正则和动作白名单校验）：",
@@ -3006,7 +3015,7 @@ impl WatchdogApp {
                                 )),
                         )
                         .when_some(self.tester.live_read_error.as_ref(), |d, err| {
-                            d.child(div().text_xs().text_color(rgb(0xfca5a5)).child(err.clone()))
+                            d.child(div().text_xs().text_color(themed(0xfca5a5)).child(err.clone()))
                         })
                         .child(self.tester.text_input.clone()),
                 ),
@@ -3100,12 +3109,12 @@ impl WatchdogApp {
                                     div()
                                         .p_2()
                                         .rounded_md()
-                                        .bg(rgb(0x0f172a))
+                                        .bg(themed(0x0f172a))
                                         .border_1()
                                         .border_color(if is_winner {
-                                            rgb(0x10b981)
+                                            themed(0x10b981)
                                         } else {
-                                            rgb(0x1e293b)
+                                            themed(0x1e293b)
                                         })
                                         .flex()
                                         .flex_row()
@@ -3128,7 +3137,7 @@ impl WatchdogApp {
                                                                 .font_weight(
                                                                     gpui::FontWeight::SEMIBOLD,
                                                                 )
-                                                                .text_color(rgb(0xf8fafc))
+                                                                .text_color(themed(0xf8fafc))
                                                                 .child(format!(
                                                                     "{} ({}) [P{}]",
                                                                     tr_item.rule_name,
@@ -3141,7 +3150,7 @@ impl WatchdogApp {
                                                 .child(
                                                     div()
                                                         .text_xs()
-                                                        .text_color(rgb(0x94a3b8))
+                                                        .text_color(themed(0x94a3b8))
                                                         .child(tr_item.detail.clone()),
                                                 ),
                                         )
@@ -3265,7 +3274,7 @@ impl WatchdogApp {
                             div()
                                 .p_4()
                                 .text_sm()
-                                .text_color(rgb(0x94a3b8))
+                                .text_color(themed(0x94a3b8))
                                 .child(tr(lang, "没有匹配的审计记录", "No matching audit records"))
                                 .into_any_element(),
                         ]
@@ -3300,7 +3309,7 @@ impl WatchdogApp {
                         div()
                             .text_base()
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(0xf8fafc))
+                            .text_color(themed(0xf8fafc))
                             .child(tr(lang, "全局设置与安全白名单", "Global Settings & Whitelist")),
                     )
                     .child(action_btn(
@@ -3315,16 +3324,16 @@ impl WatchdogApp {
                     div()
                         .p_3()
                         .rounded_md()
-                        .bg(rgb(0x450a0a))
+                        .bg(themed(0x450a0a))
                         .border_1()
-                        .border_color(rgb(0xef4444))
+                        .border_color(themed(0xef4444))
                         .flex()
                         .flex_col()
                         .gap_1()
                         .children(s.validation_errors.iter().map(|e| {
                             div()
                                 .text_xs()
-                                .text_color(rgb(0xfca5a5))
+                                .text_color(themed(0xfca5a5))
                                 .child(format!("• {e}"))
                         })),
                 )
@@ -3353,6 +3362,45 @@ impl WatchdogApp {
                         s.language == UiLanguage::En,
                         cx.listener(|app, _, _, cx| {
                             app.settings.language = UiLanguage::En;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(field_label(tr(lang, "界面主题:", "Theme:")))
+                    .child(choice_chip(
+                        "theme-light",
+                        ThemeMode::Light.label_i18n(lang),
+                        s.theme == ThemeMode::Light,
+                        cx.listener(|app, _, _, cx| {
+                            app.settings.theme = ThemeMode::Light;
+                            set_theme_mode(cx, ThemeMode::Light);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(choice_chip(
+                        "theme-dark",
+                        ThemeMode::Dark.label_i18n(lang),
+                        s.theme == ThemeMode::Dark,
+                        cx.listener(|app, _, _, cx| {
+                            app.settings.theme = ThemeMode::Dark;
+                            set_theme_mode(cx, ThemeMode::Dark);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(choice_chip(
+                        "theme-system",
+                        ThemeMode::System.label_i18n(lang),
+                        s.theme == ThemeMode::System,
+                        cx.listener(|app, _, _, cx| {
+                            app.settings.theme = ThemeMode::System;
+                            set_theme_mode(cx, ThemeMode::System);
                             cx.notify();
                         }),
                     )),
@@ -3648,14 +3696,14 @@ impl WatchdogApp {
         div()
             .p_3()
             .rounded_lg()
-            .bg(rgb(0x111827))
+            .bg(themed(0x111827))
             .border_1()
             .border_color(if installed {
-                rgb(0x1e3a8a)
+                themed(0x1e3a8a)
             } else if self.luvus_installing || self.luvus_checking {
-                rgb(0x334155)
+                themed(0x334155)
             } else {
-                rgb(0x991b1b)
+                themed(0x991b1b)
             })
             .flex()
             .flex_col()
@@ -3677,7 +3725,7 @@ impl WatchdogApp {
                                 div()
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xf8fafc))
+                                    .text_color(themed(0xf8fafc))
                                     .child(tr(lang, "luvus 运行环境检测", "luvus CLI Environment")),
                             )
                             .child(badge(badge_text, badge_bg, badge_fg)),
@@ -3711,14 +3759,14 @@ impl WatchdogApp {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(themed(0x94a3b8))
                     .child(detail_text),
             )
             .when_some(self.luvus_install_feedback.as_ref(), |d, (is_err, msg)| {
                 d.child(
                     div()
                         .text_xs()
-                        .text_color(if *is_err { rgb(0xfca5a5) } else { rgb(0x6ee7b7) })
+                        .text_color(if *is_err { themed(0xfca5a5) } else { themed(0x6ee7b7) })
                         .child(msg.clone()),
                 )
             })
@@ -3743,21 +3791,21 @@ impl Render for WatchdogApp {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x0f172a))
-            .text_color(rgb(0xe2e8f0))
+            .bg(themed(0x0f172a))
+            .text_color(themed(0xe2e8f0))
             .border_1()
-            .border_color(rgb(0x1e293b))
+            .border_color(themed(0x1e293b))
             .child(self.render_header(window, cx))
             .when_some(self.snapshot.last_config_error.as_ref(), |d, err| {
                 d.child(
                     div()
                         .px_4()
                         .py_2()
-                        .bg(rgb(0x450a0a))
+                        .bg(themed(0x450a0a))
                         .border_b_1()
-                        .border_color(rgb(0xef4444))
+                        .border_color(themed(0xef4444))
                         .text_xs()
-                        .text_color(rgb(0xfca5a5))
+                        .text_color(themed(0xfca5a5))
                         .child(format!("{}: {err}", tr(lang, "配置告警", "Config Warning"))),
                 )
             })
@@ -3766,15 +3814,15 @@ impl Render for WatchdogApp {
                     div()
                         .px_4()
                         .py_1()
-                        .bg(if *is_err { rgb(0x450a0a) } else { rgb(0x064e3b) })
+                        .bg(if *is_err { themed(0x450a0a) } else { themed(0x064e3b) })
                         .border_b_1()
-                        .border_color(if *is_err { rgb(0xef4444) } else { rgb(0x10b981) })
+                        .border_color(if *is_err { themed(0xef4444) } else { themed(0x10b981) })
                         .flex()
                         .flex_row()
                         .items_center()
                         .justify_between()
                         .text_xs()
-                        .text_color(if *is_err { rgb(0xfca5a5) } else { rgb(0xa7f3d0) })
+                        .text_color(if *is_err { themed(0xfca5a5) } else { themed(0xa7f3d0) })
                         .child(msg.clone())
                         .child(small_btn(
                             "dismiss-banner",
@@ -3812,7 +3860,7 @@ impl Render for WatchdogApp {
                     let dy = (delta * std::f32::consts::TAU * 2.5).cos() * 3.0 * decay;
                     let el = el.left(px(dx)).top(px(dy));
                     if delta < 0.98 {
-                        el.border_1().border_color(rgb(0xfacc15))
+                        el.border_1().border_color(themed(0xfacc15))
                     } else {
                         el
                     }
@@ -3830,10 +3878,10 @@ fn badge(label: impl Into<SharedString>, bg: u32, fg: u32) -> impl IntoElement {
         .px_2()
         .py(px(2.))
         .rounded_sm()
-        .bg(rgb(bg))
+        .bg(themed(bg))
         .text_xs()
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(rgb(fg))
+        .text_color(themed(fg))
         .child(label.into())
 }
 
@@ -3848,12 +3896,12 @@ fn action_btn(
         .px_3()
         .py_1()
         .rounded_md()
-        .bg(rgb(bg))
+        .bg(themed(bg))
         .border_1()
-        .border_color(rgb(0x334155))
+        .border_color(themed(0x334155))
         .text_xs()
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(rgb(0xf8fafc))
+        .text_color(themed(0xf8fafc))
         .cursor_pointer()
         .hover(|s| s.opacity(0.88))
         .on_mouse_up(MouseButton::Left, handler)
@@ -3870,13 +3918,13 @@ fn small_btn(
         .px_2()
         .py(px(2.))
         .rounded_sm()
-        .bg(rgb(0x1e293b))
+        .bg(themed(0x1e293b))
         .border_1()
-        .border_color(rgb(0x334155))
+        .border_color(themed(0x334155))
         .text_xs()
-        .text_color(rgb(0xe2e8f0))
+        .text_color(themed(0xe2e8f0))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x334155)))
+        .hover(|s| s.bg(themed(0x334155)))
         .on_mouse_up(MouseButton::Left, handler)
         .child(label.into())
 }
@@ -3904,9 +3952,21 @@ fn choice_chip(
         .cursor_pointer()
         .text_xs()
         .border_1()
-        .border_color(if active { rgb(0x3b82f6) } else { rgb(0x334155) })
-        .bg(if active { rgb(0x1e3a8a) } else { rgb(0x0f172a) })
-        .text_color(if active { rgb(0xffffff) } else { rgb(0x94a3b8) })
+        .border_color(if active {
+            themed(0x3b82f6)
+        } else {
+            themed(0x334155)
+        })
+        .bg(if active {
+            themed(0x1e3a8a)
+        } else {
+            themed(0x0f172a)
+        })
+        .text_color(if active {
+            themed_pair(0xffffff, 0x0f172a)
+        } else {
+            themed(0x94a3b8)
+        })
         .on_mouse_up(MouseButton::Left, handler)
         .child(label.into())
 }
@@ -3915,7 +3975,7 @@ fn field_label(text: impl Into<SharedString>) -> impl IntoElement {
     div()
         .text_xs()
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(rgb(0x94a3b8))
+        .text_color(themed(0x94a3b8))
         .child(text.into())
 }
 
@@ -3938,24 +3998,24 @@ fn kpi_card(
         .flex_1()
         .p_3()
         .rounded_md()
-        .bg(rgb(0x0b1220))
+        .bg(themed(0x0b1220))
         .border_1()
-        .border_color(rgb(0x1e293b))
+        .border_color(themed(0x1e293b))
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_xs().text_color(rgb(0x94a3b8)).child(title.into()))
+        .child(div().text_xs().text_color(themed(0x94a3b8)).child(title.into()))
         .child(
             div()
                 .text_xl()
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(0xf8fafc))
+                .text_color(themed(0xf8fafc))
                 .child(value.into()),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x64748b))
+                .text_color(themed(0x64748b))
                 .truncate()
                 .child(subtitle.into()),
         )
@@ -3992,9 +4052,9 @@ fn section_card(title: impl Into<SharedString>, body: impl IntoElement) -> impl 
     div()
         .p_3()
         .rounded_md()
-        .bg(rgb(0x0b1220))
+        .bg(themed(0x0b1220))
         .border_1()
-        .border_color(rgb(0x1e293b))
+        .border_color(themed(0x1e293b))
         .flex()
         .flex_col()
         .gap_3()
@@ -4002,7 +4062,7 @@ fn section_card(title: impl Into<SharedString>, body: impl IntoElement) -> impl 
             div()
                 .text_sm()
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(0xf1f5f9))
+                .text_color(themed(0xf1f5f9))
                 .child(title.into()),
         )
         .child(body)
@@ -4019,9 +4079,9 @@ fn audit_row(rec: &AuditRecord, lang: UiLanguage) -> impl IntoElement {
     div()
         .p_2()
         .rounded_md()
-        .bg(rgb(0x0b1220))
+        .bg(themed(0x0b1220))
         .border_1()
-        .border_color(rgb(0x1e293b))
+        .border_color(themed(0x1e293b))
         .flex()
         .flex_col()
         .gap_1()
@@ -4043,7 +4103,7 @@ fn audit_row(rec: &AuditRecord, lang: UiLanguage) -> impl IntoElement {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(0x64748b))
+                                .text_color(themed(0x64748b))
                                 .child(pretty_time_with_clock(
                                     rec.timestamp,
                                     chrono::Utc::now(),
@@ -4054,7 +4114,7 @@ fn audit_row(rec: &AuditRecord, lang: UiLanguage) -> impl IntoElement {
                             div()
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xe2e8f0))
+                                .text_color(themed(0xe2e8f0))
                                 .child(format!("{} ({} / {})", rec.pane, rec.agent, rec.status)),
                         )
                         .child(badge(rec.result.label(), res_bg, res_fg))
@@ -4068,14 +4128,14 @@ fn audit_row(rec: &AuditRecord, lang: UiLanguage) -> impl IntoElement {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x93c5fd))
+                        .text_color(themed(0x93c5fd))
                         .child(rec.action_summary.clone()),
                 ),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(0x94a3b8))
+                .text_color(themed(0x94a3b8))
                 .child(format!(
                     "{}{}",
                     rec.detail,
@@ -4108,13 +4168,13 @@ fn win_control_btn(
         .rounded_md()
         .cursor_pointer()
         .text_sm()
-        .text_color(rgb(0xcbd5e1))
-        .bg(rgb(0x131d31))
+        .text_color(themed(0xcbd5e1))
+        .bg(themed(0x131d31))
         .hover(move |s| {
             if danger {
-                s.bg(rgb(0xb91c1c)).text_color(rgb(0xffffff))
+                s.bg(themed(0xb91c1c)).text_color(themed(0xffffff))
             } else {
-                s.bg(rgb(0x334155)).text_color(rgb(0xf8fafc))
+                s.bg(themed(0x334155)).text_color(themed(0xf8fafc))
             }
         })
         .on_click(on_click)
@@ -4261,6 +4321,10 @@ pub fn launch_gui(cli_dry_run: bool) -> anyhow::Result<()> {
     let gui_engine = Arc::clone(&engine);
     Application::new().run(move |cx: &mut App| {
         bind_input_keys(cx);
+        {
+            let eng = gui_engine.lock().unwrap();
+            crate::ui::theme::init(cx, eng.config.theme);
+        }
         let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
         cx.open_window(
             WindowOptions {

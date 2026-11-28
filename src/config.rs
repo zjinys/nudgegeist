@@ -80,6 +80,29 @@ pub enum UiLanguage {
     En,
 }
 
+/// UI color scheme. `System` follows the OS light/dark appearance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    Light,
+    #[default]
+    Dark,
+    System,
+}
+
+impl ThemeMode {
+    pub fn label_i18n(&self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::Light, UiLanguage::Zh) => "浅色",
+            (Self::Light, UiLanguage::En) => "Light",
+            (Self::Dark, UiLanguage::Zh) => "深色",
+            (Self::Dark, UiLanguage::En) => "Dark",
+            (Self::System, UiLanguage::Zh) => "跟随系统",
+            (Self::System, UiLanguage::En) => "System",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportMode {
@@ -106,6 +129,9 @@ pub struct WatchdogConfig {
     pub version: u32,
     #[serde(default)]
     pub language: UiLanguage,
+    /// UI theme. Defaults to dark so existing configurations keep their look.
+    #[serde(default)]
+    pub theme: ThemeMode,
     #[serde(default)]
     pub transport_mode: TransportMode,
     #[serde(default)]
@@ -211,6 +237,7 @@ impl Default for WatchdogConfig {
         Self {
             version: CONFIG_SCHEMA_VERSION,
             language: UiLanguage::Zh,
+            theme: ThemeMode::Dark,
             transport_mode: TransportMode::Auto,
             luvus_socket_path: String::new(),
             luvus_bin: default_luvus_bin(),

@@ -13,8 +13,8 @@ use tempfile::TempDir;
 use nudgegeist::audit::{AuditResult, SkipReason};
 use nudgegeist::config::{
     ActionType, AppPaths, DedupeStrategy, MatchSource, ReviewStatus, Rule, RuleAction,
-    RuleDedupe, RuleGuards, RuleMatch, RulesFile, TransportMode, UiLanguage, WatchdogConfig,
-    import_rules_json, load_or_init_config, save_json_atomic, validate_rule,
+    RuleDedupe, RuleGuards, RuleMatch, RulesFile, ThemeMode, TransportMode, UiLanguage,
+    WatchdogConfig, import_rules_json, load_or_init_config, save_json_atomic, validate_rule,
 };
 use nudgegeist::engine::{
     FinalDecision, WatchdogEngine, evaluate_rules_stateless, parse_quota_reset_delay,
@@ -659,6 +659,22 @@ fn test_idle_badge_color_and_i18n_language_persistence() {
     engine.set_language(UiLanguage::En).unwrap();
     let reloaded = WatchdogEngine::initialize(paths, false).unwrap();
     assert_eq!(reloaded.config.language, UiLanguage::En);
+}
+
+#[test]
+fn test_theme_mode_defaults_to_dark_and_is_persisted() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path());
+    let mut engine = WatchdogEngine::initialize(paths.clone(), false).unwrap();
+    assert_eq!(engine.config.theme, ThemeMode::Dark);
+    assert_eq!(ThemeMode::System.label_i18n(UiLanguage::Zh), "跟随系统");
+    assert_eq!(ThemeMode::Light.label_i18n(UiLanguage::En), "Light");
+
+    let mut cfg = engine.config.clone();
+    cfg.theme = ThemeMode::System;
+    engine.save_config(cfg).unwrap();
+    let reloaded = WatchdogEngine::initialize(paths, false).unwrap();
+    assert_eq!(reloaded.config.theme, ThemeMode::System);
 }
 
 #[test]
