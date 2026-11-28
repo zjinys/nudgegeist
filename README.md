@@ -128,3 +128,13 @@ make release
 # Windows 打包（生成 .msi 安装包与便携版 .zip，需安装 WiX Toolset v3.x）
 powershell -File scripts/package-msi.ps1 dist
 ```
+
+---
+
+## 致谢（Acknowledgements）
+
+Nudgegeist 建立在 GPUI 之上——也就是 Zed 编辑器使用的 UI 框架——以及 `Cargo.toml` 中列出的众多开源 Rust crate。它也是 luvus 的搭档：luvus 负责管理会话，Nudgegeist 负责让会话别卡住。
+
+感谢 [LINUX DO](https://linux.do/) 社区，以及所有愿意把工具开源出来给人用的人。
+
+名字来自 “nudge”（轻推一下）和 “-geist”（守在一旁的小精灵）——一个在 Agent 卡住时戳它一下的小东西。中文名叫「辣椒」：一记带劲儿的小刺激。
